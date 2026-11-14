@@ -129,7 +129,8 @@ On a PS TV, or with a DualShock paired, the controller's own L2, R2, L3 and R3 b
 
 ## Unlock All
 
-Hold SELECT while the game starts (from the LiveArea until the text screen shows): a screen offers to unlock
+Hold SELECT as the game starts (press it right after starting the game from the LiveArea; holding it for the
+first few seconds is enough): a screen offers to unlock
 everything, every character and form, stage, song and item, and 4,850,000 Zenni, in your save as the game loads it.
 It is the game's own unlock routine (the developers left it in, never called; arielxflores's Vita port offers it the
 same way). The game keeps it when it saves next. Your save as it was is copied first to
