@@ -1,6 +1,13 @@
 # Changes (PS Vita port)
 
-## Unreleased
+## v1.9-optimized (2026-11-14)
+
+- **Unlock All**: SELECT held while the game starts shows a screen that gives the save everything (every character
+  and form, stage, song and item, 4,850,000 Zenni), with the game's own unlock routine, as arielxflores's Vita port
+  does. The save as it was is copied first to `ux0:data/bt3/saves/unlock_backup.bin`, and the same screen can put it
+  back.
+
+## v1.8-optimized (2026-11-14)
 
 - An `.iso` cut short (a copy that stopped early, or one on a FAT32 card, which holds files up to 4 GB) is told on
   the error screen: its size against the disc's, and what to do, instead of only "archive not found". `log.txt`

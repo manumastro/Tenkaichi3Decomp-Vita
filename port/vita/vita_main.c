@@ -1668,6 +1668,99 @@ static void read_settings(void) {
     }
 }
 
+/* Unlock All, a cheat on the text screen before the game's first picture: SELECT held while the game starts (as in
+   arielxflores's Vita port, whose start menu has it). It is the game's own unlock, Save_UnlockAll (a routine the game
+   has but never calls): every character and form, stage, song and item, and 4,850,000 Zenni, given to the save the
+   game loads next (src/menu/menu_i_b.c BootCard_OnFlowDone); the game keeps them when it saves next. The save as it
+   was is copied first to UNLOCK_BACKUP (the first copy only: the one from before anything was unlocked), and Undo
+   puts that copy back. */
+#define UNLOCK_BACKUP HOME "/saves/unlock_backup.bin"
+static int sUnlock; /* 1 unlock, 2 undo: done to the save the game loads next */
+
+static int file_there(const char *path) {
+    SceIoStat st;
+    return sceIoGetstat(path, &st) >= 0;
+}
+
+static void unlock_menu(void) {
+    int es = 0, there;
+    unsigned b;
+
+#ifdef PORT_VITA_BT4
+    {   /* the Spanish release: the screen in Spanish (its font has no accents) */
+        extern int gVitaBt4English;
+        es = !gVitaBt4English;
+    }
+#endif
+    if (!(buttons() & SCE_CTRL_SELECT)) {
+        return;
+    }
+    there = file_there(UNLOCK_BACKUP);
+    logf_("vita: start: the unlock screen (SELECT held)%s\n", there ? ", a copy of the save from before is there" : "");
+    psvDebugScreenPrintf("\e[H\e[2J\n\e[33m%s\e[39m\n\n", es ? "Desbloquear todo (truco)" : "Unlock All (cheat)");
+    psvDebugScreenPrintf("%s\n  %s\n\n",
+                         es ? "Todos los personajes y transformaciones, escenarios,\ncanciones y objetos, y 4.850.000 Zenis, en tu partida\n"
+                              "cuando el juego la cargue. El juego los guarda la\nproxima vez que guarde. Antes se copia tu partida en"
+                            : "Every character and form, stage, song and item, and\n4,850,000 Zenni, given to your save as the game loads\n"
+                              "it. The game keeps them when it saves next. Your save\nas it is now is copied first to",
+                         UNLOCK_BACKUP);
+    psvDebugScreenPrintf("%s\n", es ? "CROSS: desbloquear todo" : "CROSS: unlock everything");
+    if (there) {
+        psvDebugScreenPrintf("%s\n", es ? "TRIANGLE: deshacer: tu partida como era antes de\n  desbloquear (lo jugado desde entonces se pierde)"
+                                        : "TRIANGLE: undo: your save as it was before the unlock\n  (what you played since then is lost)");
+    }
+    psvDebugScreenPrintf("%s\n", es ? "CIRCLE o START: jugar sin cambios" : "CIRCLE or START: play without changes");
+    b = wait_buttons(SCE_CTRL_CROSS | SCE_CTRL_CIRCLE | SCE_CTRL_START | (there ? SCE_CTRL_TRIANGLE : 0));
+    sUnlock = (b & SCE_CTRL_CROSS) ? 1 : (b & SCE_CTRL_TRIANGLE) ? 2 : 0;
+    logf_("vita: start: unlock screen: %s\n", sUnlock == 1 ? "unlock" : sUnlock == 2 ? "undo" : "nothing");
+    psvDebugScreenPrintf("\e[H\e[2J");
+}
+
+/* The save just loaded or made (src/menu/menu_i_b.c BootCard_OnFlowDone): 1 when it is to be given everything now
+   (its copy is kept); an undo puts the copy back into it here. */
+int Vita_UnlockOnLoad(void *save, int size) {
+    int what = sUnlock;
+    SceUID fd;
+    int n;
+
+    sUnlock = 0;
+    if (what == 1) {
+        if (file_there(UNLOCK_BACKUP)) {
+            logf_("vita: unlock all: given to the save (the copy from before the first unlock stays in %s)\n", UNLOCK_BACKUP);
+            return 1;
+        }
+        fd = sceIoOpen(UNLOCK_BACKUP ".new", SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0666);
+        n = fd >= 0 ? sceIoWrite(fd, save, (SceSize)size) : -1;
+        if (fd >= 0) {
+            sceIoClose(fd);
+        }
+        if (n != size || sceIoRename(UNLOCK_BACKUP ".new", UNLOCK_BACKUP) < 0) {
+            sceIoRemove(UNLOCK_BACKUP ".new");
+            logf_("vita: unlock all: not done, the save's copy could not be written (%08x)\n", (unsigned)fd);
+            return 0;
+        }
+        logf_("vita: unlock all: given to the save, its copy from before in %s\n", UNLOCK_BACKUP);
+        return 1;
+    }
+    if (what == 2) {
+        void *old = malloc((size_t)size);
+        fd = sceIoOpen(UNLOCK_BACKUP, SCE_O_RDONLY, 0);
+        n = fd >= 0 && old != NULL ? sceIoRead(fd, old, (SceSize)size) : -1;
+        if (fd >= 0) {
+            sceIoClose(fd);
+        }
+        if (n == size) {
+            memcpy(save, old, (size_t)size);
+            sceIoRemove(UNLOCK_BACKUP);
+            logf_("vita: unlock all: undone, the save as it was before put back\n");
+        } else {
+            logf_("vita: unlock all: the undo failed, the copy could not be read (%08x)\n", (unsigned)fd);
+        }
+        free(old);
+    }
+    return 0;
+}
+
 static void start_screen(void) {
 #ifdef PORT_VITA_RELEASE
     /* The released program: no start screen. The game from its start (logos, title, menus). */
@@ -2038,6 +2131,8 @@ int __wrap_main(int argc, char **argv) {
             psvDebugScreenPrintf("\e[H\e[2J");
         }
     }
+    start_step("the unlock screen");
+    unlock_menu(); /* (SELECT held) */
     start_step("memory");
     Vita_MapMemory(sHeapCdram);
     logf_("vita: %s floats, game heap at 0x%08X, disc folder %s, %s\n", gPortFastFloat ? "hardware" : "exact", (unsigned)gVitaHeapBase, gVitaDisc,
