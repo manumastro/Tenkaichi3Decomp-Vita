@@ -400,6 +400,7 @@ static void summary(int final) {
    the status. The game does not wait for anything in this build, so blanks per second IS the game's speed. */
 static unsigned long long sStallEndT; /* (the game's thread: when it last came out of a blank's wait, and the console's count then) */
 static unsigned sStallEndVc;
+static void unlock_in_menus(void); /* (Unlock All from the menus, below) */
 void Vita_VBlank(unsigned vblanks) {
     unsigned long long t;
 
@@ -1172,6 +1173,18 @@ void Vita_VBlank(unsigned vblanks) {
             t0 = t; vb0 = vblanks; drawn0 = gVitaGsDrawn;
         }
     }
+    {   /* Unlock All from the menus: SELECT alone held for a second and a half (three of these half-second steps) */
+        extern int gVitaInMenus;
+        static int selHeld;
+        if (gVitaInMenus && (buttons() & (SCE_CTRL_START | SCE_CTRL_SELECT | SCE_CTRL_LTRIGGER | SCE_CTRL_RTRIGGER)) == SCE_CTRL_SELECT) {
+            if (++selHeld >= 3) {
+                selHeld = 0;
+                unlock_in_menus();
+            }
+        } else {
+            selHeld = 0;
+        }
+    }
     if ((buttons() & (SCE_CTRL_START | SCE_CTRL_SELECT | SCE_CTRL_LTRIGGER | SCE_CTRL_RTRIGGER)) == (SCE_CTRL_START | SCE_CTRL_SELECT)) {
         static int held;
         if (++held >= 3) { /* a second and a half: both are buttons of the game too */
@@ -1702,74 +1715,77 @@ static void read_settings(void) {
     }
 }
 
-/* Unlock All, a cheat on the text screen before the game's first picture: SELECT held while the game starts (as in
-   arielxflores's Vita port, whose start menu has it). It is the game's own unlock, Save_UnlockAll (a routine the game
-   has but never calls): every character and form, stage, song and item, and 4,850,000 Zenni, given to the save the
-   game loads next (src/menu/menu_i_b.c BootCard_OnFlowDone); the game keeps them when it saves next. The save as it
-   was is copied first to UNLOCK_BACKUP (the first copy only: the one from before anything was unlocked), and Undo
+/* Unlock All, a cheat on a text screen: SELECT held while the game starts (as in arielxflores's Vita port, whose
+   start menu has it), or held for a second and a half while the menus run. It is the game's own unlock,
+   Save_UnlockAll (a routine the game has but never calls): every character and form, stage, song and item, and
+   4,850,000 Zenni. At the start it is given to the save the game loads next (src/menu/menu_i_b.c
+   BootCard_OnFlowDone); from the menus to the save in use at once. The game keeps it when it saves next. The save as
+   it was is copied first to UNLOCK_BACKUP (the first copy only: the one from before anything was unlocked), and Undo
    puts that copy back. */
 #define UNLOCK_BACKUP HOME "/saves/unlock_backup.bin"
+#define UNLOCK_SAVE_SIZE 0x4000 /* SAVE_SIZE, include/sys/save.h */
 static int sUnlock; /* 1 unlock, 2 undo: done to the save the game loads next */
 static int sSelectSeen; /* SELECT down at one of the start's steps (start_step): it need not be held to the screen */
+static volatile int sTextPause; /* the menus' unlock screen is up: the game waits (the watchdog leaves it alone) */
 
 static int file_there(const char *path) {
     SceIoStat st;
     return sceIoGetstat(path, &st) >= 0;
 }
 
-static void unlock_menu(void) {
-    int es = 0, there;
+static int unlock_es(void) {
+#ifdef PORT_VITA_BT4
+    extern int gVitaBt4English; /* the Spanish release: the screen in Spanish (its font has no accents) */
+    return !gVitaBt4English;
+#else
+    return 0;
+#endif
+}
+
+/* The screen's text and its choice: 1 unlock, 2 undo (only with the copy there), 0 nothing. `now`: from the menus. */
+static int unlock_ask(int now) {
+    int es = unlock_es(), there = file_there(UNLOCK_BACKUP);
     unsigned b;
 
-#ifdef PORT_VITA_BT4
-    {   /* the Spanish release: the screen in Spanish (its font has no accents) */
-        extern int gVitaBt4English;
-        es = !gVitaBt4English;
-    }
-#endif
-    if (!sSelectSeen && !(buttons() & SCE_CTRL_SELECT)) {
-        return;
-    }
-    there = file_there(UNLOCK_BACKUP);
-    logf_("vita: start: the unlock screen (SELECT held)%s\n", there ? ", a copy of the save from before is there" : "");
     psvDebugScreenPrintf("\e[H\e[2J\n\e[33m%s\e[39m\n\n", es ? "Desbloquear todo (truco)" : "Unlock All (cheat)");
     psvDebugScreenPrintf("%s\n  %s\n\n",
-                         es ? "Todos los personajes y transformaciones, escenarios,\ncanciones y objetos, y 4.850.000 Zenis, en tu partida\n"
-                              "cuando el juego la cargue. El juego los guarda la\nproxima vez que guarde. Antes se copia tu partida en"
-                            : "Every character and form, stage, song and item, and\n4,850,000 Zenni, given to your save as the game loads\n"
-                              "it. The game keeps them when it saves next. Your save\nas it is now is copied first to",
+                         es ? (now ? "Todos los personajes y transformaciones, escenarios,\ncanciones y objetos, y 4.850.000 Zenis, en tu partida\n"
+                                     "ahora. Guarda en Opciones (o el juego guarda solo tras\nun combate) para conservarlo. Antes se copia tu partida en"
+                                   : "Todos los personajes y transformaciones, escenarios,\ncanciones y objetos, y 4.850.000 Zenis, en tu partida\n"
+                                     "cuando el juego la cargue. El juego los guarda la\nproxima vez que guarde. Antes se copia tu partida en")
+                            : (now ? "Every character and form, stage, song and item, and\n4,850,000 Zenni, given to your save now. Save in Options\n"
+                                     "(or the game saves by itself after a fight) to keep it.\nYour save as it is now is copied first to"
+                                   : "Every character and form, stage, song and item, and\n4,850,000 Zenni, given to your save as the game loads\n"
+                                     "it. The game keeps them when it saves next. Your save\nas it is now is copied first to"),
                          UNLOCK_BACKUP);
     psvDebugScreenPrintf("%s\n", es ? "CROSS: desbloquear todo" : "CROSS: unlock everything");
     if (there) {
         psvDebugScreenPrintf("%s\n", es ? "TRIANGLE: deshacer: tu partida como era antes de\n  desbloquear (lo jugado desde entonces se pierde)"
                                         : "TRIANGLE: undo: your save as it was before the unlock\n  (what you played since then is lost)");
     }
-    psvDebugScreenPrintf("%s\n", es ? "CIRCLE o START: jugar sin cambios" : "CIRCLE or START: play without changes");
-    b = wait_buttons(SCE_CTRL_CROSS | SCE_CTRL_CIRCLE | SCE_CTRL_START | (there ? SCE_CTRL_TRIANGLE : 0));
-    sUnlock = (b & SCE_CTRL_CROSS) ? 1 : (b & SCE_CTRL_TRIANGLE) ? 2 : 0;
-    logf_("vita: start: unlock screen: %s\n", sUnlock == 1 ? "unlock" : sUnlock == 2 ? "undo" : "nothing");
-    psvDebugScreenPrintf("\e[H\e[2J");
+    psvDebugScreenPrintf("%s\n", now ? (es ? "CIRCLE: volver al juego" : "CIRCLE: back to the game")
+                                     : (es ? "CIRCLE o START: jugar sin cambios" : "CIRCLE or START: play without changes"));
+    b = wait_buttons(SCE_CTRL_CROSS | SCE_CTRL_CIRCLE | (now ? 0 : SCE_CTRL_START) | (there ? SCE_CTRL_TRIANGLE : 0));
+    return (b & SCE_CTRL_CROSS) ? 1 : (b & SCE_CTRL_TRIANGLE) ? 2 : 0;
 }
 
-/* The save just loaded or made (src/menu/menu_i_b.c BootCard_OnFlowDone): 1 when it is to be given everything now
-   (its copy is kept); an undo puts the copy back into it here. */
-int Vita_UnlockOnLoad(void *save, int size) {
-    int what = sUnlock;
+/* `what` (1 unlock, 2 undo) done to `save`: 1 when it is to be given everything now (its copy is kept: nothing is
+   unlocked when the copy cannot be written); an undo puts the copy back into it here. */
+static int unlock_do(int what, void *save) {
     SceUID fd;
     int n;
 
-    sUnlock = 0;
     if (what == 1) {
         if (file_there(UNLOCK_BACKUP)) {
             logf_("vita: unlock all: given to the save (the copy from before the first unlock stays in %s)\n", UNLOCK_BACKUP);
             return 1;
         }
         fd = sceIoOpen(UNLOCK_BACKUP ".new", SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0666);
-        n = fd >= 0 ? sceIoWrite(fd, save, (SceSize)size) : -1;
+        n = fd >= 0 ? sceIoWrite(fd, save, UNLOCK_SAVE_SIZE) : -1;
         if (fd >= 0) {
             sceIoClose(fd);
         }
-        if (n != size || sceIoRename(UNLOCK_BACKUP ".new", UNLOCK_BACKUP) < 0) {
+        if (n != UNLOCK_SAVE_SIZE || sceIoRename(UNLOCK_BACKUP ".new", UNLOCK_BACKUP) < 0) {
             sceIoRemove(UNLOCK_BACKUP ".new");
             logf_("vita: unlock all: not done, the save's copy could not be written (%08x)\n", (unsigned)fd);
             return 0;
@@ -1778,14 +1794,14 @@ int Vita_UnlockOnLoad(void *save, int size) {
         return 1;
     }
     if (what == 2) {
-        void *old = malloc((size_t)size);
+        void *old = malloc(UNLOCK_SAVE_SIZE);
         fd = sceIoOpen(UNLOCK_BACKUP, SCE_O_RDONLY, 0);
-        n = fd >= 0 && old != NULL ? sceIoRead(fd, old, (SceSize)size) : -1;
+        n = fd >= 0 && old != NULL ? sceIoRead(fd, old, UNLOCK_SAVE_SIZE) : -1;
         if (fd >= 0) {
             sceIoClose(fd);
         }
-        if (n == size) {
-            memcpy(save, old, (size_t)size);
+        if (n == UNLOCK_SAVE_SIZE) {
+            memcpy(save, old, UNLOCK_SAVE_SIZE);
             sceIoRemove(UNLOCK_BACKUP);
             logf_("vita: unlock all: undone, the save as it was before put back\n");
         } else {
@@ -1794,6 +1810,78 @@ int Vita_UnlockOnLoad(void *save, int size) {
         free(old);
     }
     return 0;
+}
+
+/* SELECT looked at every 16 ms from the program's first steps to the unlock screen, on a thread of its own: a short
+   press at any moment of the start counts (the steps alone missed a press between two of them). */
+static volatile int sSelectWatch = 1;
+static int select_watch(SceSize args, void *argp) {
+    (void)args;
+    (void)argp;
+    while (sSelectWatch) {
+        if (buttons() & SCE_CTRL_SELECT) {
+            sSelectSeen = 1;
+        }
+        sceKernelDelayThread(16000);
+    }
+    return 0;
+}
+
+static void select_watch_start(void) {
+    SceUID th = sceKernelCreateThread("bt3_select", select_watch, 0x10000100, 0x1000, 0, 0, NULL);
+    if (th >= 0) {
+        sceKernelStartThread(th, 0, NULL);
+    }
+}
+
+/* At the start (SELECT down at any moment of it, or now) */
+static void unlock_menu(void) {
+    sSelectWatch = 0;
+    if (!sSelectSeen && !(buttons() & SCE_CTRL_SELECT)) {
+        return;
+    }
+    logf_("vita: start: the unlock screen\n");
+    sUnlock = unlock_ask(0);
+    logf_("vita: start: unlock screen: %s\n", sUnlock == 1 ? "unlock" : sUnlock == 2 ? "undo" : "nothing");
+    psvDebugScreenPrintf("\e[H\e[2J");
+}
+
+/* The save just loaded or made (src/menu/menu_i_b.c BootCard_OnFlowDone): 1 when it is to be given everything now */
+int Vita_UnlockOnLoad(void *save, int size) {
+    int what = sUnlock;
+    (void)size;
+    sUnlock = 0;
+    return unlock_do(what, save);
+}
+
+/* From the menus (Vita_VBlank, on the game's thread between two of its pictures): the game waits while the text
+   screen is up, and its next picture takes the screen back. */
+static void unlock_in_menus(void) {
+    extern void *gSaveData;
+    extern void Save_UnlockAll(void *opt);
+    int what;
+
+    if (gSaveData == NULL) {
+        return;
+    }
+    sTextPause = 1;
+    logf_("vita: menus: the unlock screen (SELECT held)\n");
+    Vita_TextScreen();
+    what = unlock_ask(1);
+    if (unlock_do(what, gSaveData)) {
+        Save_UnlockAll(gSaveData);
+    }
+    logf_("vita: menus: unlock screen: %s\n", what == 1 ? "unlock" : what == 2 ? "undo" : "nothing");
+    if (what != 0) {
+        psvDebugScreenPrintf("\n\e[32m%s\e[39m\n", unlock_es() ? (what == 1 ? "Hecho. Guarda en Opciones para conservarlo." : "Hecho.")
+                                                               : (what == 1 ? "Done. Save in Options to keep it." : "Done."));
+        sceKernelDelayThread(1500000);
+    }
+    while (buttons() & (SCE_CTRL_CROSS | SCE_CTRL_CIRCLE | SCE_CTRL_TRIANGLE | SCE_CTRL_SELECT | SCE_CTRL_START)) {
+        sceKernelDelayThread(20000); /* (all let go first: the press that chose is not the menu's too) */
+    }
+    psvDebugScreenPrintf("\e[H\e[2J");
+    sTextPause = 0;
 }
 
 static void start_screen(void) {
@@ -1960,7 +2048,7 @@ static int watchdog_thread(SceSize args, void *argp) {
             extern void Vita_PgoTick(void);
             Vita_PgoTick();
         }
-        if (gGsFrame != last) {
+        if (gGsFrame != last || sTextPause) { /* (the menus' unlock screen up: the game waits on purpose) */
             last = gGsFrame;
             still = 0;
             continue;
@@ -2140,6 +2228,7 @@ int __wrap_main(int argc, char **argv) {
 #ifndef PORT_VITA_RELEASE
     setenv("BT3_TRACE", "600", 1); /* the fight's state every 600 blanks into out.txt: comparable with a PC run */
 #endif
+    select_watch_start(); /* (Unlock All: SELECT pressed at any moment of the start) */
     log_plugins();
     start_step("settings");
     read_settings();
