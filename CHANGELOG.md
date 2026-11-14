@@ -1,6 +1,6 @@
 # Changes (PS Vita port)
 
-## Unreleased
+## v1.8-optimized (2026-11-14)
 
 - An `.iso` cut short (a copy that stopped early, or one on a FAT32 card, which holds files up to 4 GB) is told on
   the error screen: its size against the disc's, and what to do, instead of only "archive not found". `log.txt`
