@@ -1,7 +1,9 @@
 # Changes (PS Vita port)
 
-## Unreleased
+## v1.10-optimized (2026-11-14)
 
+- Unlock All's screen shows when SELECT was down at any step of the start, not only at the moment the screen would
+  show: letting SELECT go a little early no longer misses it.
 - The `.iso` is also found one folder down in `ux0:data/bt3/`, as an archive unpacks it (the BT4 fork's change, for
   Team BT4's archive, which holds its image in `PS2_NTSC/`).
 
