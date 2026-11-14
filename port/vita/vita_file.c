@@ -343,6 +343,7 @@ extern char gVitaDisc[];
 extern void *Port_LowAlloc(size_t size);
 extern void Port_LowFree(void *addr);
 extern void Vita_Fatal(const char *fmt, ...);
+extern int Vita_IsoWhy(const char *path, char *out, int size);
 unsigned gVitaFileOpens, gVitaFileBytes; /* for the status screen */
 unsigned gVitaFileReads, gVitaFileReadsGame;       /* for the log: reads, and those of the game's thread, and their time */
 unsigned long long gVitaFileUs, gVitaFileUsGame;
@@ -443,6 +444,10 @@ int ADXF_LoadPartitionNw(int ptid, char *fname, void *dir, void *ptinfo) {
     data_path(fname, path, sizeof(path));
     pt->fd = sceIoOpen(path, SCE_O_RDONLY, 0);
     if (pt->fd < 0) {
+        char why[200];
+        if (Vita_IsoWhy(path, why, sizeof(why))) {
+            Vita_Fatal("archive not found:\n  %s\n(error 0x%08X)\n\n%s", path, (unsigned)pt->fd, why);
+        }
         Vita_Fatal("archive not found:\n  %s\n(error 0x%08X)", path, (unsigned)pt->fd);
     }
     snprintf(pt->path, sizeof(pt->path), "%s", path);

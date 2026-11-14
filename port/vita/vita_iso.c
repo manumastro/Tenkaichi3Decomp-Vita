@@ -65,6 +65,8 @@ typedef struct IsoMount {
     int len;
     IsoEntry *ent;
     int n;
+    SceOff have, need; /* the image's size, and the disc's (its volume's) */
+    int lost;          /* files cut off by an image cut short */
 } IsoMount;
 
 typedef struct IsoOpen {
@@ -101,7 +103,7 @@ typedef struct Scan {
     SceUID fd;
     SceOff imageSize;
     IsoEntry *ent;
-    int n, bad;
+    int n, bad, lost;
 } Scan;
 
 static void scan_dir(Scan *s, uint32_t lba, uint32_t size, int parent, int depth) {
@@ -153,8 +155,11 @@ static void scan_dir(Scan *s, uint32_t lba, uint32_t size, int parent, int depth
         e->dir = (r[25] & 2) != 0;
         e->lba = le32(r + 2);
         e->size = le32(r + 10);
-        if (!e->dir && (SceOff)e->lba * ISO_SECTOR + e->size > s->imageSize) {
-            continue; /* (beyond the image's end: a copy cut short) */
+        if (!e->dir && (SceOff)e->lba * ISO_SECTOR + e->size > s->imageSize) { /* (beyond the image's end: a copy cut short) */
+            s->lost++;
+            Vita_Log("iso:   %s cut off: it ends at byte %lld, the image has %lld\n", e->name,
+                     (long long)e->lba * ISO_SECTOR + e->size, (long long)s->imageSize);
+            continue;
         }
         s->n++;
     }
@@ -167,8 +172,9 @@ static void scan_dir(Scan *s, uint32_t lba, uint32_t size, int parent, int depth
     }
 }
 
-/* the image's folders, or 0 (not an ISO 9660 image) */
-static int scan_image(const char *path, IsoEntry **ent) {
+/* the image's folders, or 0 (not an ISO 9660 image); its size and the disc's in `have` and `need`, the files cut
+   off in `lost` */
+static int scan_image(const char *path, IsoEntry **ent, SceOff *have, SceOff *need, int *lost) {
     uint8_t pvd[ISO_SECTOR];
     Scan s;
 
@@ -184,11 +190,14 @@ static int scan_image(const char *path, IsoEntry **ent) {
         __real_sceIoClose(s.fd);
         return 0;
     }
+    *have = s.imageSize;
+    *need = (SceOff)le32(pvd + 80) * ISO_SECTOR; /* (the volume's sectors) */
     s.ent = malloc(sizeof(IsoEntry) * ISO_ENTRIES);
     if (s.ent != NULL) {
         scan_dir(&s, le32(pvd + 156 + 2), le32(pvd + 156 + 10), -1, 0);
     }
     __real_sceIoClose(s.fd);
+    *lost = s.lost;
     if (s.ent == NULL || s.bad || s.n == 0) {
         free(s.ent);
         return 0;
@@ -546,7 +555,8 @@ int __wrap_sceIoDclose(SceUID fd) {
 int Vita_IsoMount(const char *path_) {
     IsoEntry *ent;
     IsoMount *im;
-    int n, m;
+    int n, m, lost = 0;
+    SceOff have = 0, need = 0;
 
     char path[sizeof(im->path)];
 
@@ -558,7 +568,7 @@ int Vita_IsoMount(const char *path_) {
             return 1;
         }
     }
-    if (sMountN >= ISO_MOUNTS || (n = scan_image(path, &ent)) == 0) {
+    if (sMountN >= ISO_MOUNTS || (n = scan_image(path, &ent, &have, &need, &lost)) == 0) {
         return 0;
     }
     im = &sMount[sMountN];
@@ -566,8 +576,33 @@ int Vita_IsoMount(const char *path_) {
     im->len = (int)strlen(im->path);
     im->ent = ent;
     im->n = n;
+    im->have = have;
+    im->need = need;
+    im->lost = lost;
     __atomic_store_n(&sMountN, sMountN + 1, __ATOMIC_RELEASE);
     Vita_Log("iso: %s mounted (%d files and folders)\n", im->path, n);
+    if (have < need || lost > 0) {
+        Vita_Log("iso: %s is cut short: %lld bytes of the disc's %lld, %d files cut off (a copy that stopped "
+                 "early; a FAT32 card holds files up to 4 GB)\n", im->path, (long long)have, (long long)need, lost);
+    }
+    return 1;
+}
+
+/* Why a file of a mounted image cannot be opened, for the error screen: 1 and the reason in `out` when its image
+   is cut short; else 0. */
+int Vita_IsoWhy(const char *path, char *out, int size) {
+    int m, i;
+    const IsoMount *im;
+
+    if (!lookup(path, &m, &i)) {
+        return 0;
+    }
+    im = &sMount[m];
+    if (im->have >= im->need && im->lost == 0) {
+        return 0;
+    }
+    snprintf(out, (size_t)size, "The .iso is cut short: %lld MB of\nthe disc's %lld MB. Copy it again\n(an exFAT card, "
+             "or unpack it\nto the disc folder: README).", (long long)(im->have >> 20), (long long)(im->need >> 20));
     return 1;
 }
 
