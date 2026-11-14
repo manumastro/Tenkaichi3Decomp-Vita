@@ -11,6 +11,15 @@ BootCard *gBootCard = NULL; /* 0x3B5908 */
 
 /* Card-flow callback (both outcomes): start the 15-frame countdown to the fade out. */
 void BootCard_OnFlowDone(void) {
+#ifdef PORT_VITA
+    {   /* Unlock All, chosen on the start's text screen (port/vita/vita_main.c): done to the save just loaded or made */
+        extern int Vita_UnlockOnLoad(void *save, int size);
+        extern void Save_UnlockAll(struct SaveData *opt);
+        if (Vita_UnlockOnLoad(gSaveData, 0x4000 /* SAVE_SIZE, include/sys/save.h */)) {
+            Save_UnlockAll(gSaveData);
+        }
+    }
+#endif
     gBootCard->flags |= BOOTCARD_DONE;
     gBootCard->flags |= BOOTCARD_LEAVING;
     gBootCard->timer = 0xF;

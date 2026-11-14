@@ -127,6 +127,16 @@ On a PS TV, or with a DualShock paired, the controller's own L2, R2, L3 and R3 b
   fingers to go back. A tap skips a film.
 - Holding START + SELECT for two seconds closes the game (press START on the screen that follows).
 
+## Unlock All
+
+Hold SELECT while the game starts (from the LiveArea until the text screen shows): a screen offers to unlock
+everything, every character and form, stage, song and item, and 4,850,000 Zenni, in your save as the game loads it.
+It is the game's own unlock routine (the developers left it in, never called; arielxflores's Vita port offers it the
+same way). The game keeps it when it saves next. Your save as it was is copied first to
+`ux0:data/bt3/saves/unlock_backup.bin`; holding SELECT at a later start offers to undo it (TRIANGLE), which puts that copy
+back (what was played since then is lost). The PS2's cheat codes (PCSX2 pnach, CodeBreaker) do nothing here: this is
+not an emulator.
+
 ## Mods
 
 Files in `ux0:data/bt3/mods/` are used instead of the disc's, laid out as for the PC version of Tenkaichi3Decomp:
