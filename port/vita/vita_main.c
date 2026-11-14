@@ -1259,6 +1259,35 @@ static int find_below(const char *dir, int depth, char *out, size_t size) {
     return found;
 }
 
+/* An .iso one folder down in `dir`, as an archive unpacks it (Team BT4's release holds PS2_NTSC/<image>.iso): 1, its
+   path in `found`, mounted. The game's own folders are skipped. */
+static int find_iso_below(const char *dir, const char *elf, char *found, int size, int *wrong) {
+    extern int Vita_IsoFind(const char *dir, const char *file, int keep, char *out, int size, int *seen);
+    static const char *const kSkip[] = {"saves", "mods", "shcache", "disc", "disk"};
+    SceUID d = sceIoDopen(dir);
+    SceIoDirent e;
+    int ok = 0, k;
+
+    if (d < 0) {
+        return 0;
+    }
+    memset(&e, 0, sizeof(e));
+    while (!ok && sceIoDread(d, &e) > 0) {
+        char sub[256];
+        int looked = 0, skip = e.d_name[0] == '.' || !SCE_S_ISDIR(e.d_stat.st_mode);
+        for (k = 0; !skip && k < (int)(sizeof(kSkip) / sizeof(kSkip[0])); k++) {
+            skip = strcasecmp(e.d_name, kSkip[k]) == 0;
+        }
+        if (skip || snprintf(sub, sizeof(sub), "%s/%s", dir, e.d_name) >= (int)sizeof(sub)) {
+            continue;
+        }
+        ok = Vita_IsoFind(sub, elf, 1, found, size, &looked);
+        *wrong += looked;
+    }
+    sceIoDclose(d);
+    return ok;
+}
+
 static void find_disc(void) {
     extern int Vita_IsoMount(const char *path);
     extern int Vita_IsoFind(const char *dir, const char *file, int keep, char *out, int size, int *seen);
@@ -1288,6 +1317,11 @@ static void find_disc(void) {
                 return;
             }
             wrong += looked;
+        }
+        if (find_iso_below(HOME, "SLUS_216.78", found, sizeof(found), &wrong)) {
+            logf_("vita: the disc's files are read from its image %s\n", found);
+            snprintf(gVitaDisc, sizeof(gVitaDisc), "%s", found);
+            return;
         }
     }
     seen[0] = '\0';
