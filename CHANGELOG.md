@@ -1,5 +1,16 @@
 # Changes (PS Vita port)
 
+## v1.7-optimized (2026-11-14)
+
+From arielxflores's v1.2.1:
+
+- Music mods' songs loop again: ADX version 3 headers (an older encoder's, in mods such as the anime songs images)
+  keep their loop at 0x18 / 0x1C / 0x24, now read there as CRI's library does; they played once and the fight went
+  on silent.
+- The start's steps and the taiHEN plugins (from `ur0:tai` and `ux0:tai` `config.txt`) in `log.txt`, written line
+  by line until the game starts, so that a start that closes the game says where.
+- README: a file over FAT32's 4 GB (copy the unpacked files, or use exFAT).
+
 ## v1.6-optimized (2026-11-14)
 
 New

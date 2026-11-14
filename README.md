@@ -64,6 +64,9 @@ not supported. Copy the image as it is to `ux0:data/bt3/` with VitaShell (USB or
 ux0:data/bt3/Dragon Ball Z Budokai Tenkaichi 3.iso
 ```
 
+A file over 4 GB cannot be on a memory card formatted as FAT32 (common with SD2Vita): if your image is larger, copy
+the unpacked files instead (each of them is smaller), or format the card as exFAT.
+
 The game reads its files from the image (arielxflores's reader, from his v1.2). Or copy only `SLUS_216.78` and the
 `BIN` and `DATA` folders from the image (the rest of the disc is not needed, about 3 GB in all), so that the memory
 card has:
