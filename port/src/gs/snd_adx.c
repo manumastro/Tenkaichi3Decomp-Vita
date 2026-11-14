@@ -235,6 +235,30 @@ static void adx_coefs(uint32_t highpass, uint32_t rate, int *c1, int *c2) {
     *c2 = (int)(c * c * -4096.0);
 }
 
+/* The file's loop in samples, where CRI's library reads it: version 4 headers (the disc's) keep it at 0x24 (on/off),
+   0x28 (start) and 0x30 (end); version 3 ones, an older encoder's (music mods' songs, such as the anime songs images),
+   at 0x18, 0x1C and 0x24 (without them a modded song played once and the fight went on silent). An end past the last
+   sample is taken as the last one. 0: no loop. arielxflores's, from his v1.2.1 (51edb19). */
+static int adx_loop(const uint8_t *h, uint32_t header, uint32_t total, uint32_t *start, uint32_t *end) {
+    uint32_t at;
+    if (h[0x12] == 4 && header >= 0x38) {
+        at = 0x24;
+    } else if (h[0x12] == 3 && header >= 0x2C) {
+        at = 0x18;
+    } else {
+        return 0;
+    }
+    if (be32(h + at) == 0) {
+        return 0;
+    }
+    *start = be32(h + at + 4);
+    *end = be32(h + at + 12);
+    if (*end > total) {
+        *end = total;
+    }
+    return *end > *start;
+}
+
 /* Decodes up to `frames` 32-sample frames at p->pos (a multiple of 32) into interleaved stereo; returns samples. */
 static int decode(Player *p, int16_t *out, int frames) {
     int n = 0, f, ch, i;
@@ -684,12 +708,7 @@ static void start(Player *p, const char *path) {
     p->rate = be32(p->file + 8);
     p->total = be32(p->file + 12);
     highpass = be16(p->file + 16);
-    p->loop = 0;
-    if (p->file[0x12] == 4 && header >= 0x38 && be32(p->file + 0x24) != 0) {
-        p->loopStart = be32(p->file + 0x28);
-        p->loopEnd = be32(p->file + 0x30);
-        p->loop = p->loopEnd > p->loopStart && p->loopEnd <= p->total;
-    }
+    p->loop = adx_loop(p->file, header, p->total, &p->loopStart, &p->loopEnd);
     if (!p->loop && p->total >= 64) {
         /* A song added from outside the disc: the disc's music has its loop in the file and goes on for as long as
            the fight does; a file made from an mp3 has none and stopped after one play, leaving the rest of the fight
