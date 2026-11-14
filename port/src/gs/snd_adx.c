@@ -34,9 +34,13 @@ enum { ADXT_STAT_STOP = 0, ADXT_STAT_PLAYING = 3, ADXT_STAT_PLAYEND = 5 };
 #define MAX_PLAYERS 16
 #define FRAME 18
 #define PAN_AUTO (-128)
+#define ST_CAP 12288   /* sample pairs a stretcher holds */
+#define ST_OV_MAX 512  /* the longest overlap (8 ms at 48 kHz is 384) */
 
 typedef struct Player {
     SDL_AudioStream *stream;
+    void *ma;               /* the miniaudio stream of an mp3/wav/flac file (snd_ma.c), NULL on the ADX path */
+    char path[512];         /* the file it plays */
     uint8_t *file;          /* the whole ADX file */
     uint32_t size, data;    /* file size; offset of the first frame */
     uint32_t channels, rate, total;
@@ -48,6 +52,11 @@ typedef struct Player {
     int stat, paused;
     int vol;                /* 0.1 dB, 0 = full, -960 and below = silent */
     int pan[2];             /* per input channel: -15 left .. 15 right, PAN_AUTO */
+    /* the game speed's time stretch (stretch_feed): decoded sound waiting to be laid out, and the end of the
+       piece laid out last, which the next one is faded over */
+    int16_t stIn[ST_CAP * 2], stTail[ST_OV_MAX * 2];
+    int stN, stHasTail;
+    double stSkip;
 #ifdef PORT_VITA
     /* the file is read piece by piece on the reading thread (vita_read.c) while it plays: `loaded` bytes of it are
        there; the decoder waits (silence) at a piece not read yet */
@@ -58,6 +67,111 @@ typedef struct Player {
 } Player;
 
 static Player sPlayers[MAX_PLAYERS];
+extern int gPortMusicFollows; /* (below, with the volumes) */
+
+/* plat_sndstate.c: which players exist and, counted in vertical blanks, what they report: the part of this that is
+   the game's state. The second is used when the state must not depend on the sound device (sByTicks). */
+typedef struct PortAdxView { int stat, paused, left, vol, pan[2]; char path[256]; } PortAdxView;
+extern int gPortAdxCount;
+extern PortAdxView gPortAdxView[MAX_PLAYERS];
+
+extern int Port_NetActive(void); /* net.c */
+static int by_ticks(void) {
+    extern int Port_NetSession(void); /* net.c */
+    static int on = -1;
+    if (on < 0) {
+        on = getenv("BT3_SYNCTEST") != NULL || getenv("BT3_SOUND_TICKS") != NULL;
+    }
+    return on || Port_NetSession();
+}
+
+/* The length of an ADX file in vertical blanks (59.94 a second), -1 if it loops, 0 if it cannot be read. */
+static int adx_blanks(const char *path) {
+    uint8_t h[0x40];
+    FILE *fp = fopen(path, "rb");
+    size_t got;
+    uint32_t header, rate, total;
+
+    {
+        /* Not ADX at all: an mp3/wav/flac stream (snd_ma.c). An added song is played round and round, so it never
+           ends (-1); another such file lasts as long as it lasts. */
+        extern int PortMa_Format(const char *path);
+        extern int PortMa_Blanks(const char *path);
+        extern int PortSongs_IsFile(const char *path); /* plat_songs.c */
+        if (PortMa_Format(path)) {
+            return PortSongs_IsFile(path) ? -1 : PortMa_Blanks(path);
+        }
+    }
+    if (fp == NULL) {
+        return 0;
+    }
+    got = fread(h, 1, sizeof(h), fp);
+    fclose(fp);
+    if (got < sizeof(h) || ((uint32_t)h[0] << 8 | h[1]) != 0x8000) {
+        return 0;
+    }
+    header = ((uint32_t)h[2] << 8 | h[3]) + 4;
+    rate = (uint32_t)h[8] << 24 | (uint32_t)h[9] << 16 | (uint32_t)h[10] << 8 | h[11];
+    total = (uint32_t)h[12] << 24 | (uint32_t)h[13] << 16 | (uint32_t)h[14] << 8 | h[15];
+    if (h[0x12] == 4 && header >= 0x38 && (h[0x24] | h[0x25] | h[0x26] | h[0x27]) != 0) {
+        return -1;
+    }
+    {
+        extern int PortSongs_IsFile(const char *path); /* plat_songs.c: an added song is played round and round (start()) */
+        if (PortSongs_IsFile(path)) {
+            return -1;
+        }
+    }
+    return rate == 0 ? 0 : (int)(((uint64_t)total * 60000 + (uint64_t)rate * 1001 - 1) / ((uint64_t)rate * 1001)) + 1;
+}
+
+/* How long a stream of the ORIGINAL disc lasts, by its place in the data (plat_adxlen_tab.h); 0 when the table does
+   not know the file. */
+#include "../plat_adxlen_tab.h"
+static int disc_blanks(const char *path) {
+    const char *at = strstr(path, "pzs3us2/"), *name;
+    int fid, i;
+
+    if (at != NULL && sscanf(at + 8, "%d.bin", &fid) == 1 && strchr(at + 8, '/') == NULL) {
+        return fid >= 0 && fid < ADXLEN_COUNT ? kAdxLen[fid] : 0;
+    }
+    name = strrchr(path, '/');
+    name = name != NULL ? name + 1 : path;
+    for (i = 0; i < (int)(sizeof(kAdxLenLoose) / sizeof(kAdxLenLoose[0])); i++) {
+        if (strcmp(name, kAdxLenLoose[i].name) == 0 && strstr(path, "disc/DATA/") != NULL) {
+            return kAdxLenLoose[i].blanks;
+        }
+    }
+    return 0;
+}
+
+/* What the game is told about a stream it starts: playing, and for how many blanks. `found`: the file is there.
+   In an online match the length is the original disc's file's, from the table, whatever file this copy has in
+   that place: the game waits for voice lines to end (the fight's intro and win talk, src/battle/btl_seq.c; the
+   menus' guides), and a player's own sound files (a voice mod under mods/, a replaced file, a missing one) must
+   not make their copy wait longer or shorter than the other's. With "Skip logos" fixed this was the other way two
+   copies came apart: one voice line of another length on one side and the fight began on another blank
+   (2026-10-13). What is HEARD is the player's own file, as long as it lasts. Outside a match nothing changes. */
+static void view_start(Player *p, const char *path, int found) {
+    PortAdxView *v = &gPortAdxView[p - sPlayers];
+    int own = found ? adx_blanks(path) : 0, blanks = own;
+
+    if (by_ticks() && Port_NetActive() && disc_blanks(path) != 0) {
+        blanks = disc_blanks(path);
+        if (blanks != own) {
+            static int said;
+            if (!said++) {
+                fprintf(stderr, "bt3: net: a sound stream here is not the original's length (%d blanks, the original %d): the match counts with the original's\n", own, blanks);
+            }
+        }
+    }
+    v->stat = blanks != 0 ? ADXT_STAT_PLAYING : ADXT_STAT_STOP;
+    v->left = blanks;
+    snprintf(v->path, sizeof(v->path), "%s", path);
+    if (getenv("BT3_SND_VERBOSE") != NULL && by_ticks()) {
+        fprintf(stderr, "adx: player %d: %s counts as %d blanks (this copy's file: %d)\n", (int)(p - sPlayers), path, blanks, own);
+    }
+}
 #ifdef PORT_VITA /* the streams' starts and the voices' changes in the log (the fighters' intro lines) */
 extern void Vita_Log(const char *fmt, ...);
 static unsigned sAdxLogN;
@@ -65,12 +179,22 @@ static unsigned sAdxLogN;
 #else
 #define ADX_LOG(...) ((void)0)
 #endif
-static int sCount;
 static SDL_AudioDeviceID sDevice;
 static int sMono, sTried;
 static unsigned sFeedCalls; /* callbacks from SDL so far (BT3_SND_VERBOSE prints it at a stop) */
 
 extern int Port_FilePath(int ptid, int flid, const char *fname, char *out, int size); /* plat_file.c */
+
+/* gs/snd_ma.c: a song or sound mod from outside the disc in mp3/wav/flac, played as it is by miniaudio. */
+extern int PortMa_Format(const char *path);
+extern int PortMa_Blanks(const char *path);
+extern void *PortMa_Start(const char *path, int loop);
+extern void PortMa_Stop(void *handle);
+extern void PortMa_SetPan(void *handle, int pan0, int pan1);
+extern void PortMa_Pause(void *handle, int paused);
+extern int PortMa_AtEnd(void *handle);
+extern void PortMa_SetMono(int mono);
+extern int PortSongs_IsFile(const char *path); /* plat_songs.c: whether the file is an added song */
 
 static uint32_t be32(const uint8_t *p) { return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]; }
 static uint32_t be16(const uint8_t *p) { return (uint32_t)p[0] << 8 | p[1]; }
@@ -181,8 +305,88 @@ static int decode(Player *p, int16_t *out, int frames) {
     return n;
 }
 
+/* What a player hands to the sound device. BT3_SND_DUMP=<file> (testing): the music player's, as it is handed
+   over (16 bits, stereo, the file's rate), to look at without listening. */
+static void put_pcm(Player *p, SDL_AudioStream *stream, const int16_t *data, int bytes) {
+    static FILE *dump;
+    static int tried;
+    if (!tried) {
+        tried = 1;
+        dump = getenv("BT3_SND_DUMP") != NULL ? fopen(getenv("BT3_SND_DUMP"), "wb") : NULL;
+    }
+    if (dump != NULL && p == &sPlayers[0]) {
+        fwrite(data, 1, (size_t)bytes, dump);
+        fflush(dump);
+    }
+    SDL_PutAudioStreamData(stream, data, bytes);
+}
+
+/* The game at another speed than its own (an online match at 120%, the Cheats tab's speed): a stream has to end
+   that much sooner or later, because the game counts its length in vertical blanks, but played faster it would
+   also sound higher ("the audio is pitched at 120%", reported). So it is played at its own pitch and made shorter
+   or longer in time, the way emulators do it at such speeds: pieces of 40 ms are laid one after the other with
+   8 ms faded into the previous one, each taken (40 - 8) * speed ms after the last, and within 15 ms of that the
+   place where it fits what was heard last (the largest correlation with the previous piece's end), which is what
+   keeps a tone from stuttering. Returns the bytes handed to the stream; 0 = the file has ended. */
+static int stretch_feed(Player *p, SDL_AudioStream *stream, int speedMilli) {
+    int seq = (int)p->rate * 40 / 1000, ov = (int)p->rate * 8 / 1000, seek = (int)p->rate * 15 / 1000;
+    int16_t out[4096 * 2];
+    int best = 0, k, i, body, need, skip, ended = 0;
+    double bestSum = -1e30;
+
+    if (ov > ST_OV_MAX) { ov = ST_OV_MAX; }
+    if (seq > 4096) { seq = 4096; }
+    body = seq - ov;
+    p->stSkip += (double)body * (double)speedMilli / 1000.0;
+    skip = (int)p->stSkip;
+    p->stSkip -= (double)skip;
+    need = seek + seq > skip ? seek + seq : skip;
+    while (p->stN < need && !ended) {
+        int n = p->stN + 16 * 32 <= ST_CAP ? decode(p, &p->stIn[p->stN * 2], 16) : 0;
+        ended = n == 0;
+        p->stN += n;
+    }
+    if (p->stN < seek + seq) { /* the end of the file: what is left, as it is */
+        int n = p->stN;
+        if (n > 0) {
+            put_pcm(p, stream, p->stIn, n * 4);
+        }
+        p->stN = 0;
+        p->stHasTail = 0;
+        return n * 4;
+    }
+    if (p->stHasTail) {
+        for (k = 0; k < seek; k += 2) { /* (every other place: fine enough, half the work) */
+            double sum = 0.0;
+            for (i = 0; i < ov; i += 2) {
+                sum += (double)((int)p->stTail[i * 2] + p->stTail[i * 2 + 1]) * (double)((int)p->stIn[(k + i) * 2] + p->stIn[(k + i) * 2 + 1]);
+            }
+            if (sum > bestSum) {
+                bestSum = sum;
+                best = k;
+            }
+        }
+        for (i = 0; i < ov; i++) {
+            float w = (float)i / (float)ov;
+            out[i * 2] = (int16_t)((float)p->stTail[i * 2] * (1.0f - w) + (float)p->stIn[(best + i) * 2] * w);
+            out[i * 2 + 1] = (int16_t)((float)p->stTail[i * 2 + 1] * (1.0f - w) + (float)p->stIn[(best + i) * 2 + 1] * w);
+        }
+    } else {
+        memcpy(out, p->stIn, (size_t)ov * 4);
+    }
+    memcpy(&out[ov * 2], &p->stIn[(best + ov) * 2], (size_t)(body - ov) * 4);
+    memcpy(p->stTail, &p->stIn[(best + body) * 2], (size_t)ov * 4);
+    p->stHasTail = 1;
+    if (skip > p->stN) { skip = p->stN; }
+    memmove(p->stIn, &p->stIn[skip * 2], (size_t)(p->stN - skip) * 4);
+    p->stN -= skip;
+    put_pcm(p, stream, out, body * 4);
+    return body * 4;
+}
+
 /* SDL's audio thread wants `additional` more bytes from this player (the stream is locked while this runs). */
 static void SDLCALL feed(void *user, SDL_AudioStream *stream, int additional, int total) {
+    extern int Port_SpeedMilli(void); /* plat_stub.c: the match's speed online, else the player's own; 1000 = the game's */
     Player *p = user;
     int16_t buf[32 * 2 * 16];
 
@@ -190,6 +394,26 @@ static void SDLCALL feed(void *user, SDL_AudioStream *stream, int additional, in
 
     (void)total;
     while (additional > 0 && p->stat == ADXT_STAT_PLAYING && !p->paused) {
+        int speed = Port_SpeedMilli();
+        if (p->loop && p - sPlayers <= 1 && gPortMusicFollows <= 0) {
+            speed = 1000;
+        }
+        if (speed != 1000) {
+            int n = stretch_feed(p, stream, speed);
+            if (n == 0) {
+                p->stat = ADXT_STAT_PLAYEND;
+                break;
+            }
+            additional -= n;
+            continue;
+        }
+        if (p->stN > 0) { /* (the speed went back to the game's own: what the stretcher still held) */
+            put_pcm(p, stream, p->stIn, p->stN * 4);
+            additional -= p->stN * 4;
+            p->stN = 0;
+            p->stHasTail = 0;
+            continue;
+        }
         int n;
 #ifdef PORT_VITA
         p->waiting = 0;
@@ -204,22 +428,56 @@ static void SDLCALL feed(void *user, SDL_AudioStream *stream, int additional, in
             p->stat = ADXT_STAT_PLAYEND;
             break;
         }
-        SDL_PutAudioStreamData(stream, buf, n * 4);
+        put_pcm(p, stream, buf, n * 4);
         additional -= n * 4;
     }
 }
 
-int gPortMusicPercent = 100, gPortSePercent = 100; /* the settings overlay's volumes */
+/* The settings overlay's volumes. The game keeps its sounds apart by itself, and the four follow that:
+     music   the first stream player ("BGM")
+     stage   the second ("MAP": a stage's background sound, the only thing stg_b.c plays there) and the stage's
+             effect bank (slot 3)
+     voices  the two voice players and the two fighters' effect banks (slots 4 and 5)
+     effects the rest: the two effect players, the common banks */
+int gPortMusicPercent = 100, gPortSePercent = 100, gPortVoicePercent = 100, gPortStagePercent = 100;
+/* "Music follows game speed" (Audio tab, setting music_follows_speed, off by default). Off: music and a stage's
+   background that loop are played as they are at any game speed: the game never waits for the end of a loop, so
+   nothing has to fit, and the songs are heard untouched. What plays once (a jingle, a spoken line) is always
+   fitted to the speed, because the game counts its length in vertical blanks. */
+int gPortMusicFollows = -1; /* (-1: not read from the settings yet) */
+
+extern float PortA11y_StreamGain(const void *player); /* a11y.c: the voices are lower in the menus */
+extern void PortMa_SetVolume(void *handle, float gain); /* gs/snd_ma.c: the miniaudio streams' volume */
+
+/* A player's linear gain: the game's own volume and the settings overlay's four percents (and a11y). */
+static float player_gain(Player *p) {
+    int ch = (int)(p - sPlayers); /* (the game makes its six players in the order of include/sys/adx.h) */
+    int percent = ch == 0 ? gPortMusicPercent : ch == 1 ? gPortStagePercent : ch == 4 || ch == 5 ? gPortVoicePercent : gPortSePercent;
+
+    return p->vol <= -960 ? 0.0f : (float)pow(10.0, (double)p->vol / 200.0) * (float)percent / 100.0f * PortA11y_StreamGain(p);
+}
 
 static void apply_volume(Player *p) {
     if (p->stream != NULL) {
-        SDL_SetAudioStreamGain(p->stream, p->vol <= -960 ? 0.0f : (float)pow(10.0, (double)p->vol / 200.0) * (float)gPortMusicPercent / 100.0f);
+        SDL_SetAudioStreamGain(p->stream, player_gain(p));
+    }
+    if (p->ma != NULL) {
+        PortMa_SetVolume(p->ma, player_gain(p)); /* the same figure, on the miniaudio side */
     }
 }
 
 static void stop(Player *p) {
-    if (p->stream != NULL && getenv("BT3_SND_VERBOSE") != NULL) {
-        fprintf(stderr, "adx: stop player %d at %.1f s, status %d, volume %d; %u callbacks so far\n", (int)(p - sPlayers), (double)p->pos / (double)p->rate, p->stat, p->vol, sFeedCalls);
+    if (getenv("BT3_SND_VERBOSE") != NULL && (p->stream != NULL || p->ma != NULL)) {
+        if (p->stream != NULL) {
+            fprintf(stderr, "adx: stop player %d at %.1f s, status %d, volume %d; %u callbacks so far\n", (int)(p - sPlayers), (double)p->pos / (double)p->rate, p->stat, p->vol, sFeedCalls);
+        }
+        else {
+            fprintf(stderr, "adx: stop player %d (miniaudio), status %d, volume %d\n", (int)(p - sPlayers), p->stat, p->vol);
+        }
+    }
+    if (p->ma != NULL) {
+        PortMa_Stop(p->ma);
+        p->ma = NULL;
     }
     if (p->stream != NULL && p - sPlayers >= 4) {
         ADX_LOG("adx: player %d stopped at %.1f s of %.1f, status %d (frame %u)\n", (int)(p - sPlayers), (double)p->pos / (double)p->rate, (double)p->total / (double)p->rate, p->stat, gGsFrame);
@@ -261,14 +519,67 @@ static int adx_piece(VitaReadJob *j, int got) {
     return 1;
 }
 #endif
+/* An online match computes with the default voice set on both sides (net.c). A player who chose the other one hears
+   it all the same: the stream that is PLAYED is the other set's file of the same line, while what the game is told
+   about it (how long it lasts: view_start) stays the default file's, so the two copies agree. Ids of partition 2
+   (file number + 0xD48), default set -> second set:
+       menu guides      0x87D4..0x8D2F  - 0x55C     (VOICE_LANG2_OFFSET)
+       fighters' lines  0xCC32..0x10B15 - 0x3EE4    (161 fighters, 100 lines each)
+       announcer        0x10B6C..0x10BA3 - 0x38
+   Checked against the disc: every id of these ranges and its partner are streams. The guides' two sets end in ten
+   near-silent files each (0x87CA..0x87D3, 0x8D26..0x8D2F); 0x8D30 and on are the fight's streamed effects (the
+   clash, a transformation's, the moves', a stage's), played the same for both voice sets: until 0.1.38 the range
+   ran on to 0x8D4D, and online a player with the second set heard a guide's line in the place of those effects. */
+static const char *voice_own_path(const char *path, char *buf, size_t size) {
+    extern int Port_NetVoiceAlt(void); /* net.c */
+    const char *dir = strstr(path, "pzs3us2/"), *num;
+    int fid, id, other = 0;
+
+    if (dir == NULL || !Port_NetVoiceAlt()) {
+        return path;
+    }
+    num = dir + 8;
+    if (sscanf(num, "%d.bin", &fid) != 1) {
+        return path;
+    }
+    id = fid + 0xD48;
+    if (id >= 0x87D4 && id < 0x8D30) {
+        other = id - 0x55C;
+    } else if (id >= 0xCC32 && id < 0x10B16) {
+        other = id - 0x3EE4;
+    } else if (id >= 0x10B6C && id < 0x10BA4) {
+        other = id - 0x38;
+    } else {
+        return path;
+    }
+    snprintf(buf, size, "%.*s%05d.bin", (int)(num - path), path, other - 0xD48);
+    {
+        FILE *fp = fopen(buf, "rb");
+        if (fp == NULL) {
+            return path; /* (not there: the default one) */
+        }
+        fclose(fp);
+    }
+    if (getenv("BT3_SND_VERBOSE") != NULL) {
+        fprintf(stderr, "adx: voice %#x played from the other voice set (%#x)\n", id, other);
+    }
+    return buf;
+}
 
 static void start(Player *p, const char *path) {
     SDL_AudioSpec spec;
     FILE *fp;
     long size;
     uint32_t header, highpass;
+    char own[512];
 
+    path = voice_own_path(path, own, sizeof(own));
+
+    if (gPortResim && (p->stream != NULL || p->ma != NULL) && strcmp(p->path, path) == 0) {
+        return; /* a frame that is only being re-run starts the stream that is playing already: it plays on */
+    }
     stop(p);
+    snprintf(p->path, sizeof(p->path), "%s", path);
     if (!device()) {
         return;
     }
@@ -326,6 +637,30 @@ static void start(Player *p, const char *path) {
         fprintf(stderr, "bt3: sound file not found: %s\n", path);
         return;
     }
+    {
+        /* Not the game's ADX (the 0x8000 mark): an mp3/wav/flac file, played here by miniaudio as it is. */
+        uint8_t mark[2] = { 0, 0 };
+        size_t got = fread(mark, 1, sizeof(mark), fp);
+        fseek(fp, 0, SEEK_SET);
+        if (!(got == sizeof(mark) && ((uint32_t)mark[0] << 8 | mark[1]) == 0x8000) && PortMa_Format(path)) {
+            /* Played round and round: an added song, or a mod that replaced a disc track of one of the two music
+               players (0 BGM, 1 MAP), whose original looped in the file. A voice line or a streaming effect (players
+               2..5) is one-shot and reports its end, as the game waits for those. */
+            int loop = PortSongs_IsFile(path) || (p - sPlayers) <= 1;
+            fclose(fp);
+            p->ma = PortMa_Start(path, loop);
+            if (p->ma == NULL) {
+                return; /* (PortMa_Start said why) */
+            }
+            PortMa_SetPan(p->ma, p->pan[0], p->pan[1]);
+            p->stat = ADXT_STAT_PLAYING;
+            apply_volume(p);
+            if (getenv("BT3_SND_VERBOSE") != NULL) {
+                fprintf(stderr, "adx: player %d: start (miniaudio) %s, loop %d, volume %d, paused %d\n", (int)(p - sPlayers), path, loop, p->vol, p->paused);
+            }
+            return;
+        }
+    }
     fseek(fp, 0, SEEK_END);
     size = ftell(fp);
     fseek(fp, 0, SEEK_SET);
@@ -355,9 +690,21 @@ static void start(Player *p, const char *path) {
         p->loopEnd = be32(p->file + 0x30);
         p->loop = p->loopEnd > p->loopStart && p->loopEnd <= p->total;
     }
+    if (!p->loop && p->total >= 64) {
+        /* A song added from outside the disc: the disc's music has its loop in the file and goes on for as long as
+           the fight does; a file made from an mp3 has none and stopped after one play, leaving the rest of the fight
+           silent. It is played again from its start. (A file that has loop points keeps them.) */
+        extern int PortSongs_IsFile(const char *path); /* plat_songs.c */
+        if (PortSongs_IsFile(path)) {
+            p->loopStart = 0;
+            p->loopEnd = p->total & ~31u; /* (whole frames) */
+            p->loop = 1;
+        }
+    }
     adx_coefs(highpass, p->rate, &p->c1, &p->c2);
     memset(p->hist, 0, sizeof(p->hist));
     p->pos = 0;
+
     spec.format = SDL_AUDIO_S16;
     spec.channels = 2;
     spec.freq = (int)p->rate;
@@ -367,11 +714,18 @@ static void start(Player *p, const char *path) {
         ADX_LOG("adx: player %d: no stream for %s\n", (int)(p - sPlayers), path);
         return;
     }
+    p->stN = 0;
+    p->stHasTail = 0;
+    p->stSkip = 0.0;
+    if (gPortMusicFollows < 0) {
+        extern int Port_Setting(const char *name, int def); /* plat_settings.c */
+        gPortMusicFollows = Port_Setting("music_follows_speed", 0) != 0;
+    }
     ADX_LOG("adx: player %d plays %s: %u ch, %u Hz, %.1f s, loop %d, volume %d, paused %d (frame %u)\n", (int)(p - sPlayers), path, p->channels, p->rate,
             (double)p->total / (double)p->rate, p->loop, p->vol, p->paused, gGsFrame);
     if (getenv("BT3_SND_VERBOSE") != NULL) {
-        fprintf(stderr, "adx: start %s: %u ch, %u Hz, %.1f s, loop %d, volume %d (0.1 dB), paused %d\n", path, p->channels, p->rate,
-                (double)p->total / (double)p->rate, p->loop, p->vol, p->paused);
+        fprintf(stderr, "adx: player %d: start %s: %u ch, %u Hz, %.1f s, loop %d, volume %d (0.1 dB), paused %d\n", (int)(p - sPlayers), path,
+                p->channels, p->rate, (double)p->total / (double)p->rate, p->loop, p->vol, p->paused);
     }
     p->stat = ADXT_STAT_PLAYING;
     apply_volume(p);
@@ -386,11 +740,14 @@ static void start(Player *p, const char *path) {
 void ADXT_Init(void) {}
 
 void *ADXT_Create(int maxnch, void *work, int worksize) {
-    Player *p = &sPlayers[sCount < MAX_PLAYERS ? sCount++ : MAX_PLAYERS - 1];
+    Player *p = &sPlayers[gPortAdxCount < MAX_PLAYERS ? gPortAdxCount++ : MAX_PLAYERS - 1];
 
     (void)maxnch; (void)work; (void)worksize;
+    stop(p); /* (a frame run again after a restore creates its players again: whatever played there ends) */
     memset(p, 0, sizeof(*p));
     p->pan[0] = p->pan[1] = PAN_AUTO;
+    memset(&gPortAdxView[p - sPlayers], 0, sizeof(PortAdxView));
+    gPortAdxView[p - sPlayers].pan[0] = gPortAdxView[p - sPlayers].pan[1] = PAN_AUTO;
     return p;
 }
 
@@ -400,24 +757,39 @@ void ADXT_SetSvrFreq(void *adxt, int freq) { (void)adxt; (void)freq; }
 void ADXT_StartAfs(void *adxt, int patid, int fid) {
     char path[512];
 
-    if (adxt != NULL && Port_FilePath(patid, fid, NULL, path, sizeof(path))) {
-        start(adxt, path);
-    } else {
-        ADX_LOG("adx: player %d: archive %d file %d not found\n", adxt != NULL ? (int)((Player *)adxt - sPlayers) : -1, patid, fid);
+    if (adxt != NULL) {
+        int found = Port_FilePath(patid, fid, NULL, path, sizeof(path));
+        if (found) {
+            extern void PortA11y_StreamStart(const char *path); /* a11y_game.c: a voice with its line shown as text */
+            start(adxt, path);
+            PortA11y_StreamStart(path);
+        } else {
+            ADX_LOG("adx: player %d: archive %d file %d not found\n", (int)((Player *)adxt - sPlayers), patid, fid);
+        }
+        if (found || (by_ticks() && Port_NetActive() && disc_blanks(path) != 0)) { /* (a match: counted even when this copy lacks the file) */
+            view_start(adxt, path, found);
+        }
     }
 }
 
 void ADXT_StartFname(void *adxt, char *fname) {
     char path[512];
 
-    if (adxt != NULL && Port_FilePath(0, 0, fname, path, sizeof(path))) {
-        start(adxt, path);
+    if (adxt != NULL) {
+        int found = Port_FilePath(0, 0, fname, path, sizeof(path));
+        if (found) {
+            start(adxt, path);
+        }
+        if (found || (by_ticks() && Port_NetActive() && disc_blanks(path) != 0)) {
+            view_start(adxt, path, found);
+        }
     }
 }
 
 void ADXT_Stop(void *adxt) {
     if (adxt != NULL) {
         stop(adxt);
+        gPortAdxView[(Player *)adxt - sPlayers].stat = ADXT_STAT_STOP;
     }
 }
 
@@ -427,13 +799,18 @@ void ADXT_Pause(void *adxt, int sw) {
     if (p == NULL) {
         return;
     }
+    gPortAdxView[p - sPlayers].paused = sw != 0;
     if (getenv("BT3_SND_VERBOSE") != NULL && p->paused != (sw != 0)) {
         fprintf(stderr, "adx: player %d pause %d\n", (int)(p - sPlayers), sw);
     }
     if (p - sPlayers >= 4 && p->paused != (sw != 0)) {
         ADX_LOG("adx: player %d pause %d (frame %u)\n", (int)(p - sPlayers), sw, gGsFrame);
     }
-    if (p->stream != NULL) {
+    if (p->ma != NULL) {
+        p->paused = sw != 0;
+        PortMa_Pause(p->ma, p->paused);
+    }
+    else if (p->stream != NULL) {
         SDL_LockAudioStream(p->stream);
         p->paused = sw != 0;
         if (p->paused) {
@@ -456,12 +833,15 @@ void ADXT_SetOutVol(void *adxt, int vol) {
             ADX_LOG("adx: player %d volume %d (frame %u)\n", (int)(p - sPlayers), vol, gGsFrame);
         }
         p->vol = vol;
+        gPortAdxView[p - sPlayers].vol = vol;
         apply_volume(p);
     }
 }
 
 int ADXT_GetOutVol(void *adxt) {
-    return adxt != NULL ? ((Player *)adxt)->vol : 0;
+    /* From the game's state, not from the player: the game fades a stream by reading this and setting a little
+       less, and a frame run again after a restore must read what the frame read the first time. */
+    return adxt != NULL ? gPortAdxView[(Player *)adxt - sPlayers].vol : 0;
 }
 
 void ADXT_SetOutPan(void *adxt, int chan, int pan) {
@@ -470,16 +850,29 @@ void ADXT_SetOutPan(void *adxt, int chan, int pan) {
     if (p != NULL && chan >= 0 && chan < 2) {
         if (p->stream != NULL) { SDL_LockAudioStream(p->stream); }
         p->pan[chan] = pan;
+        gPortAdxView[p - sPlayers].pan[chan] = pan;
         if (p->stream != NULL) { SDL_UnlockAudioStream(p->stream); }
+        if (p->ma != NULL) { PortMa_SetPan(p->ma, p->pan[0], p->pan[1]); }
     }
 }
 
 void ADXT_SetOutputMono(int flag) {
     sMono = flag != 0;
+    PortMa_SetMono(flag); /* taken over by a native stream the next time it starts */
 }
 
 int ADXT_GetStat(void *adxt) {
-    return adxt != NULL ? ((Player *)adxt)->stat : ADXT_STAT_STOP;
+    if (adxt != NULL && by_ticks()) {
+        return gPortAdxView[(Player *)adxt - sPlayers].stat; /* counted in vertical blanks, the same on every machine */
+    }
+    if (adxt != NULL) {
+        Player *p = adxt;
+        if (p->ma != NULL && p->stat == ADXT_STAT_PLAYING && PortMa_AtEnd(p->ma)) {
+            p->stat = ADXT_STAT_PLAYEND; /* a native file that is not looped has reached its end */
+        }
+        return p->stat;
+    }
+    return ADXT_STAT_STOP;
 }
 
 /* A CRI call the movie player makes (0x277A70 in the PS2 executable, not named): asked with the movie's sound
@@ -495,5 +888,26 @@ void Port_AudioRefresh(void) {
     int i;
     for (i = 0; i < MAX_PLAYERS; i++) {
         apply_volume(&sPlayers[i]);
+    }
+}
+
+/* The game's state was exchanged for another (into an online session, or back from one): the streams that are
+   sounding belong to the state that is gone. Everything stops, and what the state now in place says is playing
+   starts again, from its beginning (where it was in the file is not kept). */
+void Port_AdxResync(void) {
+    int i;
+    for (i = 0; i < MAX_PLAYERS; i++) {
+        Player *p = &sPlayers[i];
+        PortAdxView *v = &gPortAdxView[i];
+        stop(p);
+        if (i < gPortAdxCount) {
+            p->vol = v->vol;
+            p->pan[0] = v->pan[0];
+            p->pan[1] = v->pan[1];
+            p->paused = v->paused;
+            if (v->stat == ADXT_STAT_PLAYING && v->path[0] != '\0') {
+                start(p, v->path);
+            }
+        }
     }
 }

@@ -40,6 +40,8 @@ uint32_t Gs_RectId(uint32_t bp, uint32_t bw, uint32_t psm, uint32_t x0, uint32_t
 extern unsigned gGsEpoch;
 #endif
 uint32_t Gs_VramRead(uint32_t bp, uint32_t bw, uint32_t psm, uint32_t x, uint32_t y);
+/* The 256-byte block of GS memory that holds the pixel (x, y) of that buffer (formats 0x00, 0x13, 0x14). */
+const uint8_t *Gs_BlockPtr(uint32_t bp, uint32_t bw, uint32_t psm, uint32_t x, uint32_t y);
 void Gs_VramReadRect(uint32_t bp, uint32_t bw, uint32_t psm, uint32_t w, uint32_t h, uint32_t *out);
 int Gs_VramReadIdx8(uint32_t bp, uint32_t bw, uint32_t psm, uint32_t w, uint32_t h, uint8_t *out, uint32_t stride);
 extern unsigned gGsFbUploads;
@@ -77,4 +79,37 @@ void GsGpu_DrawVu6(int ctx, const float *vertices, uint32_t count, const float *
 void Gs_RegWrite(uint32_t addr, uint64_t d);
 void GsGpu_Native(int effect); /* marker register 0x7F: a native effect goes here */
 void GsGpu_FrameEnd(void);
+/* The game is re-running frames it has already shown (online play after a late input; the save / restore test):
+   nothing of them is to be seen or heard. The frame's list is still walked, because it also carries the texture
+   uploads and vertex programs that later frames count on, but no draw is recorded, nothing is shown, and no
+   sound starts. (gs/state.c) */
+extern int gPortResim;
+/* The frame being computed is not shown because the machine is behind (gs_draw.c: frame skipping). Its drawing
+   is left out the way a re-run frame's is; the game itself (and its sound) go on as always. */
+#ifdef PORT_VITA /* (the Vita: no rollback, and a frame it leaves out is gs_core.c's own gVitaGsSkip) */
+#define GS_NO_PICTURE 0
+#else
+extern int gsSkipFrame;
+#define GS_NO_PICTURE (gPortResim || gsSkipFrame)
+#endif
+
+/* gs_core.c: with the render thread (BT3_GS_THREAD), waits until it has finished the list it runs, before the
+   game's thread touches what the thread uses (GS memory and registers, the back end). At once without it, or on
+   the render thread itself. */
+void Gs_RenderIdle(void);
+int Gs_RenderThreaded(void);  /* the render thread is on */
+int Gs_OnRenderThread(void);  /* and this is it */
+int GsGpu_BackendIsGl(void);  /* gs_draw.c: the OpenGL back end is the one running */
+
+/* Settings are read from the environment all over the renderer, some of them for every batch a model sends
+   (tens of thousands of times per frame). The C library's getenv is cheap on Linux and slow on Windows (a lock
+   and a case-insensitive search of a much larger environment): there it cost more than half of a frame. In the
+   renderer's files getenv is this instead: the answer for a name is looked up once and remembered. (Nothing here
+   changes the environment while the game runs.) */
+#include <stdlib.h>
+const char *Port_GetEnv(const char *name);
+/* Each place a variable is asked for remembers its answer (the names are literals; the environment does not
+   change while the game runs). Asked in the middle of drawing, the search in Port_GetEnv was 3% of a frame. */
+#define getenv(name) (__extension__({ static const char *v_; static int k_; if (!k_) { v_ = Port_GetEnv(name); k_ = 1; } v_; }))
+
 #endif

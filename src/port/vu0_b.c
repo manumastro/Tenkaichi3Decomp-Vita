@@ -35,6 +35,11 @@
 #include <string.h>
 
 #include "port/vu0_b.h"
+#ifdef REF_VU0_EXTERN_ARITH
+/* The port compiles this file without the compiler's built-in functions, which made every float <-> bit pattern
+   conversion below (a memcpy of four bytes) a call into the C library: several per float operation. */
+#define memcpy(d, s, n) __builtin_memcpy(d, s, n)
+#endif
 
 /* ------------------------------------------------------------------------------------------------------------------
  * VU0 state and imports: shared with the first half (default) or local (REF_VU0_B_STANDALONE). See vu0_b.h.
@@ -98,9 +103,16 @@ static float f_from(uint32_t u) {
 
 #ifndef REF_VU0_B_STANDALONE
 /* Shared build: the first half's primitives decide the number model. */
+#ifdef REF_VU0_EXTERN_ARITH /* the port: the arithmetic of port/src/softfloat_ps2.c, in place */
+#include "softfloat_ps2_inl.h"
+static float f_add(float a, float b) { return f_from(Sf_AddBits(f_bits(a), f_bits(b))); }
+static float f_sub(float a, float b) { return f_from(Sf_AddBits(f_bits(a), f_bits(b) ^ 0x80000000u)); }
+static float f_mul(float a, float b) { return f_from(Sf_MulBits(f_bits(a), f_bits(b))); }
+#else
 static float f_add(float a, float b) { return RefVu0_Add(a, b); }
 static float f_sub(float a, float b) { return RefVu0_Sub(a, b); }
 static float f_mul(float a, float b) { return RefVu0_Mul(a, b); }
+#endif
 static float f_div(float a, float b) { return RefVu0_Div(a, b); }
 static float f_sqrt(float a) { return f_from(RefVu0_SqrtBits(f_bits(a))); }
 static int f_lt(float a, float b) { return RefVu0_LtBits(f_bits(a), f_bits(b)); }
@@ -231,6 +243,15 @@ static float f_minf(float a, float b) { return f_key(a) <= f_key(b) ? a : b; }
 static RefVec4f mtx_apply(const RefVec4f *r, RefVec4f v) {
     RefVec4f acc;
     RefVec4f o;
+
+#if defined(REF_VU0_EXTERN_ARITH) && !defined(REF_VU0_B_STANDALONE)
+    {   /* the port: the same sequence with the processor's arithmetic where that is exact (port/src/plat_fastvec.c) */
+        extern int Port_FastMtxApply(const uint32_t *r, const uint32_t *v, uint32_t *out);
+        if (!mode(0) && !mode(2) && Port_FastMtxApply((const uint32_t *)r, (const uint32_t *)&v, (uint32_t *)&o)) {
+            return o;
+        }
+    }
+#endif
 
     acc.x = f_mul(r[0].x, v.x);
     acc.y = f_mul(r[0].y, v.x);

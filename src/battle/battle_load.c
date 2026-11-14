@@ -9,6 +9,23 @@
 #include "sys/loading.h"
 #include "sys/save.h"
 
+#ifdef PORT
+/* PC build: a stage added from outside the disc (id 0x24 on) has no files on the disc. Every file id the game
+   would form for it belongs to another file: 0x171 + stage runs into the split-screen models of the disc's
+   stages (0x198 on), and 0x14E + stage into the models (0x171 on). So an added stage's model has a file id of
+   its own, far past the end of the second archive, which the port's file layer serves from the stages folder
+   (port/src/plat_stages.c), and for its sound bank the first stage's is asked for. */
+/* (70000: past the end of the second archive, which has 65,201 files. It was 30000, taken for free; those are
+   the training mode's guide voice lines, and with n stages added the first n of them were replaced by stage
+   files. Found 2026-10-08 while listing the file ids for added characters.) */
+#define PORT_ADDED_STAGE_FILE(stage) (0xD48 + 70000 + ((stage) - 0x24))
+#define BTL_STAGE_MODEL(stage) ((stage) >= 0x24 ? PORT_ADDED_STAGE_FILE(stage) : (stage) + BTL_FILE_STAGE)
+#define BTL_STAGE_BANK(stage) (((stage) >= 0x24 ? 0 : (stage)) + BTL_FILE_SND_STAGE)
+#else
+#define BTL_STAGE_MODEL(stage) ((stage) + BTL_FILE_STAGE)
+#define BTL_STAGE_BANK(stage) ((stage) + BTL_FILE_SND_STAGE)
+#endif
+
 /*
  * Battle loader, result block, events, battle setup and replay block: 0x127120..0x12B570, one object file in
  * the original (its .rodata only lines up as one object: the jump table of BtlLoad_StepStageChange at +0, the
@@ -182,13 +199,21 @@ s32 BtlLoad_StepStageReload(BtlJob *job) {
         break;
     case 1:
         BtlLoad_BeginStageSwap();
+#ifdef PORT
+        /* PC build: a stage added from outside the disc (id 0x24 on) has one model only, and the file id its
+           split-screen model would have belongs to other files (the menu archives, the stage transitions): it
+           is loaded for split screen too. The disc's own stages keep their lighter split-screen model. */
+        if (Battle_GetStage() >= 0x24) {
+            id = BTL_STAGE_MODEL(Battle_GetStage());
+        } else
+#endif
         if (Battle_IsSplitScreen()) {
             id = Battle_GetStage() + BTL_FILE_STAGE_SPLIT;
         } else {
             id = Battle_GetStage() + BTL_FILE_STAGE;
         }
         res->stage = File_Request3(id, res->stage, res->stageSize);
-        res->bank = File_Request3(Battle_GetStage() + BTL_FILE_SND_STAGE, res->bank, res->bankSize);
+        res->bank = File_Request3(BTL_STAGE_BANK(Battle_GetStage()), res->bank, res->bankSize);
         job->state++;
         return 0;
     case 2:
@@ -244,8 +269,8 @@ s32 BtlLoad_StepStageChange(BtlJob *job) {
         job->state++;
         return 0;
     case 4:
-        res->stage = File_Request3(Battle_GetStage() + BTL_FILE_STAGE, res->stage, res->stageSize);
-        res->bank = File_Request3(Battle_GetStage() + BTL_FILE_SND_STAGE, res->bank, res->bankSize);
+        res->stage = File_Request3(BTL_STAGE_MODEL(Battle_GetStage()), res->stage, res->stageSize);
+        res->bank = File_Request3(BTL_STAGE_BANK(Battle_GetStage()), res->bank, res->bankSize);
         job->state++;
         return 0;
     case 5:
@@ -474,7 +499,7 @@ s32 BtlLoad_StepInitial(BtlJob *job) {
     switch (job->state) {
     case 0:
         res->sndCommon = File_Request3(BTL_FILE_SND_COMMON, NULL, 0);
-        res->sndStage = File_Request3(Battle_GetStartStage() + BTL_FILE_SND_STAGE, NULL, 0);
+        res->sndStage = File_Request3(BTL_STAGE_BANK(Battle_GetStartStage()), NULL, 0);
         res->sndChara[0] = File_Request3(BattleSide_GetStartChara(0) + ((gSaveData->flags & SAVE_FLAG_VOICE) ? BTL_FILE_VOICE_ALT : BTL_FILE_VOICE), NULL, 0);
         res->sndChara[1] = File_Request3(BattleSide_GetStartChara(1) + ((gSaveData->flags & SAVE_FLAG_VOICE) ? BTL_FILE_VOICE_ALT : BTL_FILE_VOICE), NULL, 0);
         job->state++;
@@ -509,8 +534,33 @@ s32 BtlLoad_StepInitial(BtlJob *job) {
     case 4:
         BattleSide_SetModelSlot(0, BtlObj_RequestCharaModel(0, BattleSide_GetStartChara(0), BattleSide_GetStartCostume(0), BattleSide_GetStartVariant(0)));
         BattleSide_SetModelSlot(1, BtlObj_RequestCharaModel(1, BattleSide_GetStartChara(1), BattleSide_GetStartCostume(1), BattleSide_GetStartVariant(1)));
+#ifdef PORT
+        {
+            /* PC build: the buffer is the game's own size unless a stage added from outside the disc is larger
+               (port/src/plat_stages.c); a file larger than the buffer overruns it, and nothing on the way checks. */
+            extern int Port_StageBufSize(void);
+            res->stageSize = Port_StageBufSize();
+        }
+#else
         res->stageSize = BTL_STAGE_BUF_SIZE;
+#endif
+#ifdef PORT
+        {
+            /* PC build: a buffer larger than the game's own does not fit its heap beside a battle's other
+               blocks (seen: 10 MB and the pools' allocation fails); it comes from the port's memory instead.
+               Heap_Free knows such a block. */
+            extern unsigned Port_GameBigAlloc(int size);
+            res->stage = NULL;
+            if (res->stageSize > BTL_STAGE_BUF_SIZE) {
+                res->stage = (void *)Port_GameBigAlloc(res->stageSize);
+            }
+            if (res->stage == NULL) {
+                res->stage = Heap_Alloc(res->stageSize, 0x40, 0, HEAP_ANY);
+            }
+        }
+#else
         res->stage = Heap_Alloc(res->stageSize, 0x40, 0, HEAP_ANY);
+#endif
         memset(res->stage, 0, res->stageSize);
         res->bankSize = BTL_BANK_BUF_SIZE;
         res->bank = Heap_Alloc(res->bankSize, 0x40, 0, HEAP_ANY);
@@ -525,6 +575,12 @@ s32 BtlLoad_StepInitial(BtlJob *job) {
                 memset(m->buf[1], 0, BTL_MEMBER_BUF_SIZE);
             }
         }
+#ifdef PORT
+        /* PC build: see the note in the stage-swap job: an added stage has one model, for split screen too. */
+        if (Battle_GetStartStage() >= 0x24) {
+            id = BTL_STAGE_MODEL(Battle_GetStartStage());
+        } else
+#endif
         if (Battle_IsSplitScreen()) {
             id = Battle_GetStartStage() + BTL_FILE_STAGE_SPLIT;
         } else {
@@ -1263,6 +1319,20 @@ void BtlMember_ApplyItems(BattleMember *m) {
     s32 stats[5];
     s32 i;
 
+#ifdef PORT
+    {
+        /* Online (a session of gs/net.c) nobody has items: the session starts from an empty save, so every item set
+           is empty, but the character selects read a set by the cell of the grid (105 cells) from a table of 97
+           (src/menu/menu_c_e.c, menu_e_b.c: set 2 chosen, then the random cell drawing a cell past 96), and the
+           bytes behind the table (the saved custom characters, which list nothing, and which items are owned, all
+           of them in a session) are taken for item ids: a player got items, a red Potara. The game does it on the
+           PS2 too, with the player's own save; online it is closed here, where every fighter's items arrive. */
+        extern int Port_NetSession(void);
+        if (Port_NetSession()) {
+            memset(&m->items, 0, sizeof(m->items));
+        }
+    }
+#endif
     ItemSet_GetStats(&m->items, stats, ability, m->chara);
     m->bonus[0] = 0;
     m->bonus[1] = stats[2];
@@ -1398,6 +1468,9 @@ void BattleSetup_InitCharaBits(BattleCharaBits *dst, BattleCharaBits *src) {
 }
 
 /* Unless options were given, takes the two per-side options from the save data. */
+#ifdef PORT
+extern int Port_NetSideOptions(int *camera, int *shake); /* port/src/gs/net.c: each player's own, the same on both copies */
+#endif
 void BattleSetup_DefaultOptions(void) {
     BattleOption *opt = &SETUP()->option;
 
@@ -1407,6 +1480,18 @@ void BattleSetup_DefaultOptions(void) {
         opt->optA[1] = gSaveData->unk1694;
         opt->optB[0] = gSaveData->unk1698;
         opt->optB[1] = gSaveData->unk1698;
+#ifdef PORT
+        {   /* An online match: the save is the session's empty one, the same on both copies; each side gets the
+               camera type and the screen shake of its player's own save instead. */
+            int camera[2], shake[2];
+            if (Port_NetSideOptions(camera, shake)) {
+                opt->optA[0] = camera[0];
+                opt->optA[1] = camera[1];
+                opt->optB[0] = shake[0];
+                opt->optB[1] = shake[1];
+            }
+        }
+#endif
     }
 }
 
@@ -1459,8 +1544,24 @@ void BattleSetup_SetOption14(s32 val) {
 void BattleSetup_SetRule(s32 screenMode, s32 mode, s32 bgm, s32 timeLimit, s32 announcer, s32 stage, s32 unk10) {
     BattleRule *rule = &SETUP()->rule;
 
+#ifdef PORT
+    {
+        extern int Port_TestScreen(void); /* BT3_TEST_SCREEN=<mode> (testing), else -1 */
+        if (Port_TestScreen() >= 0) {
+            screenMode = Port_TestScreen();
+        }
+    }
+#endif
     rule->screenMode = screenMode;
     rule->mode = mode;
+#ifdef PORT
+    {
+        extern int Port_TestBgm(void); /* port/src/plat_songs.c: BT3_TEST_BGM=<entry> (testing), else -1 */
+        if (Port_TestBgm() >= 0) {
+            bgm = Port_TestBgm();
+        }
+    }
+#endif
     if (bgm == 24) {
         rule->bgm = rand() % 24;
     } else {
@@ -1469,6 +1570,14 @@ void BattleSetup_SetRule(s32 screenMode, s32 mode, s32 bgm, s32 timeLimit, s32 a
     rule->timeLimit = timeLimit;
     rule->announcer = announcer;
     rule->unk10 = unk10;
+#ifdef PORT
+    {
+        extern int Port_TestStage(void); /* port/src/plat_stages.c: BT3_TEST_STAGE=<id> (testing), else -1 */
+        if (Port_TestStage() >= 0) {
+            stage = Port_TestStage();
+        }
+    }
+#endif
     rule->stage = stage;
     rule->curStage = stage;
 }

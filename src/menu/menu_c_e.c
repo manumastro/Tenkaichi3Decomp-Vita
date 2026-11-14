@@ -3,6 +3,32 @@
 #include "sys/common.h"
 #include "sys/pad.h"
 #include "sys/save.h"
+#ifdef PORT
+#include "battle/col_c.h" /* FontStyle / FONT_ALIGN_* / FONT_SHADOW_*, for the names of added stages */
+#include "plat_stages.h"  /* the manifest of added stages: their ids, names and file aliases */
+#include "plat_songs.h"   /* the manifest of added songs (the music select) */
+#include <stdio.h>
+#include <stdlib.h>
+/* include/battle/view_a.h holds these, but pulling it in clashes with menu_d.h (MsgWin_Init); the values are
+   fixed, so they are repeated here for the stage list of the PC build. */
+#define STGGRID_COLS 6
+#define STGGRID_ID_LOCKED 0x3E
+#define STGGRID_ID_EMPTY 0x3F
+static s32 sPortStagesAdded; /* this stage select shows stages from outside the disc */
+static s32 sPortSongsAdded;  /* ... and its music list songs from outside the disc */
+static s32 sPortSongNameHidden, sPortStageNameHidden;
+/* The port's stage-name overlay (port/src/gs/ui.cpp / gs_draw.c): the names of added stages are drawn by the
+   port, over the picture, from its own stylized art. The menu only fills the name's rectangle and which image. */
+extern volatile int gUiNameX, gUiNameY, gUiNameW, gUiNameH;
+extern volatile int gUiNameIdx, gUiNameReady;
+extern volatile int gUiSongX, gUiSongY, gUiSongW, gUiSongH;
+extern volatile int gUiSongIdx, gUiSongReady, gUiSongLit;
+#endif
+#ifdef PORT
+extern void Port_MenuPage(int screen); /* port/src/gs_marker.c: widescreen menus */
+extern void Port_MenuFill(int on);
+extern void Port_MenuMovie(int index);
+#endif
 
 /*
  * CharSel, 0x342190..0x348D78: the character / stage / music select of the versus modes (progress modes 38..41
@@ -72,7 +98,25 @@ void CharSel_SetStageChips(void) {
 
         gCharSel->stage->chip[1][i] = gCharSel->stage->chip[0][i];
         gCharSel->stage->chip[0][i] = id;
+#ifdef PORT
+        /* PC build: the icon pack holds one icon per stage plus the locked and empty ones (37, 38). A map added
+           from outside the disc (id >= 0x24) borrows an icon; the markers keep theirs even though they moved up. */
+        {
+            s32 icon;
+            if (id == STGGRID_ID_LOCKED) {
+                icon = 37;
+            } else if (id == STGGRID_ID_EMPTY) {
+                icon = 38;
+            } else if (id >= 0x24) {
+                icon = 1 + (id - 0x24) % 36;
+            } else {
+                icon = id + 1;
+            }
+            res = (MTexRes *)MPACK_AT(gCharSel->stagePack, icon);
+        }
+#else
         res = (MTexRes *)MPACK_AT(gCharSel->stagePack, id + 1);
+#endif
         gCharSel->tex[41 + i] = gCharSel->tex[slot[i]];
         gCharSel->tex[slot[i]] = res->tex;
     }
@@ -244,7 +288,7 @@ void CharSel_UpdateStageLoad(void) {
         break;
     case CHARSEL_LOAD_REQUEST:
         File_CancelRequests();
-        File_Request(gCharSel->stage->stage + CHARSEL_STAGE_FILE, gCharSel->stageFile, 0x3B800);
+        File_Request(CHARSEL_STAGE_FILE_ID(gCharSel->stage->stage), gCharSel->stageFile, 0x3B800);
         gCharSel->stageState = CHARSEL_LOAD_READ;
         break;
     case CHARSEL_LOAD_READ:
@@ -396,6 +440,15 @@ void CharSel_Init(s32 section) {
     CS_RES(gCharSel->res, 12);
     gCharSel->tex[47] = MTEX(res, 0);
     gCharSel->tex[48] = MTEX(res, 1);
+#ifdef PORT
+    {
+        /* PC build: the name sheets of this screen (stage names: image 39; song names: image 19, and image 20 for
+           the open music list), for the letters the port draws the names of added stages and songs with
+           (port/src/gs/namefont.c). Addresses as numbers; the port only reads them. */
+        extern void Port_NameFontSheets(int stage, int song, int songLit);
+        Port_NameFontSheets((int)(u32)gCharSel->tex[39], (int)(u32)gCharSel->tex[19], (int)(u32)gCharSel->tex[20]);
+    }
+#endif
     Flash_Create(&gCharSel->flash[0], MPACK_AT(gCharSel->res, 15), gCharSel->tex);
     Flash_Play(&gCharSel->flash[0], 1);
 
@@ -489,12 +542,131 @@ void CharSel_Init(s32 section) {
     gCharSel->stageIds = (s32 *)(MPACK_AT(gCharSel->res, 39) + 0x10);
     gCharSel->stageCount = MPACK_WORD(gCharSel->res, 39);
     StgGrid_ApplyUnlocks(&gCharSel->stageCount, gCharSel->stageIds);
+#ifdef PORT
+    {
+        /* PC build: append stage ids for maps added from outside the disc (BT3_EXTRA_STAGES) and, optionally, swap
+           the id in a slot (BT3_STAGE_REPLACE). Their model/sound/picture come from BT3_FILE_ALIAS. The ids are
+           parsed in the port layer (headless.c) and read here as globals: a getenv result must not be dereferenced
+           in game code (its host pointer would be truncated to the game's 32-bit ones). The list is copied to a
+           buffer of ours and padded with "empty" cells to fill the last row, because the grid is a reel of rows and
+           it always reads whole rows. This runs AFTER the game has applied the save's unlocks to its own list
+           (just above): the added ids are appended to the result and are never looked up in the save, so the
+           save file is not touched and stays valid for a copy of the game without these stages. In an online
+           session nothing is added: both players must have the same list. */
+        extern int gPortStageReplaceCount, gPortReplaceOld[16], gPortReplaceNew[16];
+        /* Room for the disc's 36 and all 26 added ones, and the padding of the last row: 62 are 11 rows of 6, 66
+           cells. (It was 64 cells with the adding stopped at 60, the last whole row that fits: with every disc
+           stage unlocked only 24 of 26 added stages were listed. Reported by a player.) */
+        static s32 sAllIds[96];
+        extern int Port_NetSession(void); /* port/src/gs/net.c */
+        s32 extra = Port_NetSession() ? 0 : gPortExtraStageCount;
+        s32 swaps = Port_NetSession() ? 0 : gPortStageReplaceCount;
+        s32 n = gCharSel->stageCount, i, rows, r;
+        if (n > 64) {
+            n = 64;
+        }
+        for (i = 0; i < n; i++) {
+            sAllIds[i] = gCharSel->stageIds[i];
+        }
+        for (i = 0; i < extra && n < 90; i++) {
+            sAllIds[n++] = (s32)gPortExtraStages[i];
+        }
+        for (r = 0; r < swaps; r++) {
+            int k;
+            for (k = 0; k < n; k++) {
+                if (sAllIds[k] == gPortReplaceOld[r]) {
+                    sAllIds[k] = (s32)gPortReplaceNew[r];
+                    break;
+                }
+            }
+        }
+        sPortStagesAdded = extra > 0 || swaps > 0;
+        if (sPortStagesAdded) {
+            rows = (n + STGGRID_COLS - 1) / STGGRID_COLS;
+            for (i = n; i < rows * STGGRID_COLS && i < 96; i++) {
+                sAllIds[i] = STGGRID_ID_EMPTY;
+            }
+            gCharSel->stageIds = sAllIds;
+            gCharSel->stageCount = n;
+        }
+    }
+#endif
+#ifdef PORT /* PC build: list the stage ids the game loaded, to see what a data pack carries (stages report) */
+    if (getenv("BT3_STAGES_DEBUG") != NULL) {
+        s32 dbg;
+        fprintf(stderr, "stages: count %d, ids:", (int)gCharSel->stageCount);
+        for (dbg = 0; dbg < gCharSel->stageCount; dbg++) {
+            fprintf(stderr, " %02x", (int)(u32)gCharSel->stageIds[dbg]);
+        }
+        fprintf(stderr, "\n");
+    }
+#endif
     gCharSel->stageRows = 6;
+#ifdef PORT
+    if (sPortStagesAdded) { /* (with nothing added the grid is the game's own, 6 rows) */
+        gCharSel->stageRows = (gCharSel->stageCount + STGGRID_COLS - 1) / STGGRID_COLS;
+    }
+#endif
     gCharSel->bgmIds = (s32 *)(MPACK_AT(gCharSel->res, 56) + 0x10);
     gCharSel->bgmCount = MPACK_WORD(gCharSel->res, 56);
     BgmList_ApplyUnlocks(&gCharSel->bgmCount, gCharSel->bgmIds);
+#ifdef PORT /* PC build: list the music ids the game loaded, to see the list a data pack carries (music report) */
+    if (getenv("BT3_BGM_DEBUG") != NULL) {
+        s32 dbg;
+        fprintf(stderr, "bgm raw: count %d, ids:", (int)gCharSel->bgmCount);
+        for (dbg = 0; dbg < gCharSel->bgmCount; dbg++) {
+            fprintf(stderr, " %02x", (int)(u32)gCharSel->bgmIds[dbg]);
+        }
+        fprintf(stderr, "\n");
+    }
+#endif
     gCharSel->bgmCount -= 4;
     gCharSel->bgmIds[gCharSel->bgmCount - 1] = CHARSEL_BGM_RANDOM;
+#ifdef PORT
+    {
+        /* PC build: append the tracks added from outside the disc (BT3_SONG manifest), keeping the game's
+           "random" entry last. Their offsets point past the disc's own entries; their files come from the
+           file layer. This runs after the game has applied the save's unlocks to its own list, and the added
+           entries are not looked up in the save: nothing is written to it. In an online session nothing is
+           added: both players must have the same list. */
+        extern int Port_NetSession(void); /* port/src/gs/net.c */
+        s32 added;
+        PortSongs_Refresh(); /* songs converted from MP3 since the start join the list here (port/src/plat_songs.c) */
+        added = Port_NetSession() ? 0 : gPortSongCount;
+        sPortSongsAdded = 0;
+        if (added > 0) {
+            static s32 sBgmIds[72];
+            s32 n = gCharSel->bgmCount, k, last = gCharSel->bgmIds[n - 1];
+            if (n > 30) {
+                n = 30;
+            }
+            if (added > PORT_SONG_MAX) {
+                added = PORT_SONG_MAX;
+            }
+            for (k = 0; k < n - 1; k++) {
+                sBgmIds[k] = gCharSel->bgmIds[k];
+            }
+            for (k = 0; k < added; k++) {
+                sBgmIds[n - 1 + k] = gPortSongOffsets[k];
+            }
+            n = n - 1 + added + 1; /* the disc's songs + the added ones + the "random" entry */
+            sBgmIds[n - 1] = last;          /* the "random" entry stays last */
+            gCharSel->bgmIds = sBgmIds;
+            gCharSel->bgmCount = n;
+            sPortSongsAdded = 1;
+        }
+    }
+#endif
+#ifdef PORT
+    if (getenv("BT3_BGM_DEBUG") != NULL) {
+        s32 dbg;
+        fprintf(stderr, "bgm final(+added): count %d, ids:", (int)gCharSel->bgmCount);
+        for (dbg = 0; dbg < gCharSel->bgmCount; dbg++) {
+            fprintf(stderr, " %02x", (int)(u32)gCharSel->bgmIds[dbg]);
+        }
+        fprintf(stderr, "\n");
+    }
+#endif
 
     gCharSel->cells[0] = (MChrCell *)(MPACK_AT(gCharSel->res, 42) + 0x10);
     gCharSel->masterCount[0] = MPACK_WORD(gCharSel->res, 42);
@@ -563,7 +735,7 @@ void CharSel_Init(s32 section) {
         gCharSel->tex[i != 0 ? 22 : 23] = MTEX(res, 0);
         gCharSel->side[i]->flags |= CHARSEL_SIDE_FACE_READY;
     }
-    File_LoadSync(gCharSel->stage->stage + CHARSEL_STAGE_FILE, gCharSel->stageFile, 0x3B800);
+    File_LoadSync(CHARSEL_STAGE_FILE_ID(gCharSel->stage->stage), gCharSel->stageFile, 0x3B800);
     Sprite_Unpack(gCharSel->stageFile, gCharSel->stageRes[gCharSel->stageBuf], NULL);
     res = gCharSel->stageRes[gCharSel->stageBuf];
     Res_RelocateOffsets(&res, res, res);
@@ -578,7 +750,7 @@ void CharSel_Init(s32 section) {
     if (gCharSel->bgmIds[gCharSel->stage->bgmPlaying] == CHARSEL_BGM_RANDOM) {
         Bgm_Play(CHARSEL_BGM_RANDOM_FIRST + Rand_Range(9));
     } else {
-        Bgm_Play(CHARSEL_BGM_FIRST + gCharSel->bgmIds[gCharSel->stage->bgmPlaying]);
+        Bgm_Play(CHARSEL_BGM_FILE(gCharSel->bgmIds[gCharSel->stage->bgmPlaying]));
     }
     for (i = 0; i < CHARSEL_SIDES; i++) {
         TextBox_Init(&gCharSel->nameBox[i], gCharSel->nameText, i + 1);
@@ -592,6 +764,10 @@ void CharSel_Init(s32 section) {
 void CharSel_Term(void) {
     s32 i;
 
+#ifdef PORT
+    gUiNameIdx = -1; /* drop the port's name overlays */
+    gUiSongIdx = -1;
+#endif
     IconWin_Term();
     ItemHelp_Term();
     ItemPanel_Term(1);
@@ -647,6 +823,10 @@ void CharSel_Draw(void) {
     s32 j;
     MFlash *f;
 
+#ifdef PORT
+    gUiNameIdx = -1; /* set again below only for a stage added from outside the disc */
+    gUiSongIdx = -1; /* and only for a song added from outside the disc (set in the music-name block) */
+#endif
     for (i = 0; i < 2; i++) {
         if (gCharSel->flags & CHARSEL_STAGE_READY) {
             switch (i) {
@@ -671,8 +851,20 @@ void CharSel_Draw(void) {
                 gCharSel->bgAlpha[1] = 0x80;
             }
         }
+#ifdef PORT
+        if (i == 0) {
+            Port_MenuPage(3); /* widescreen menus: this screen's page (port/src/gs_marker.c), the stage pictures filling the width */
+        }
+        Port_MenuFill(1);
         Sprite_DrawPicture(gCharSel->bg[i], 0, 0, gCharSel->bgAlpha[i]);
+        Port_MenuFill(0);
+#else
+        Sprite_DrawPicture(gCharSel->bg[i], 0, 0, gCharSel->bgAlpha[i]);
+#endif
     }
+#ifdef PORT
+    Port_MenuPage(3); /* (also when the first picture was left out above) */
+#endif
 
     f = &gCharSel->flash[0];
     for (i = 0; i < CHARSEL_SIDES; i++) {
@@ -701,12 +893,71 @@ void CharSel_Draw(void) {
 
     uv.x0 = 0;
     uv.x1 = 0x200;
+#ifndef PORT
     uv.y0 = (gCharSel->stage->stage % 4) * 0x40;
     uv.y1 = uv.y0 + 0x40;
     uv.unk10 = gCharSel->stage->stage / 4;
+#endif
     Flash_FindLabel(f, NULL, "mc_map_name", &ref);
+#ifdef PORT
+    {
+        /* PC build: the movie's name atlas only holds the stages of the disc (0..0x23). A stage added from
+           outside the disc has no name there, so the atlas clip is hidden and the name is printed with the
+           game's own font at the clip's place (the font queue is flushed at the end of this draw). */
+        extern void Flash_ClipGetPos(MFlash *flash, MFlashRef *ref, s32 *x, s32 *y);
+        extern void Font_PrintAsciiAt(s32 x, s32 y, char *str);
+        extern s32 Font_GetGlyphHeight(void);
+        extern FontStyle gFontStyle;
+        s32 nameId = gCharSel->stage->stage;
+
+        if (nameId >= 0x24) {
+            s32 nx = 0, ny = 0; /* (an empty clip reference leaves them untouched) */
+            s32 idx = nameId - 0x24;
+            Flash_ClipSetFlags(f, &ref, 2, 0); /* FLASH_PROP_VISIBLE: hide the atlas name */
+            sPortStageNameHidden = 1;
+            Flash_ClipGetPos(f, &ref, &nx, &ny);
+            /* Only where the name clip exists: the stage select. This draw also runs on the character select
+               (the last stage stays chosen after a fight), where the movie has no such clip; the name was then
+               drawn at the top of the screen, at the place an empty reference leaves (seen by the user). */
+            if (ref.id >= 0 && idx >= 0 && idx < gPortExtraStageCount) {
+                if (gUiNameReady) {
+                    /* The port draws the name (its own art: the menu's stylized font) over the picture. The
+                       rectangle is the clip's, in the game's 512x448 pixels; the strip image is idx. */
+                    gUiNameX = nx + 64;   /* centre the 384-wide strip in the 512-wide clip window */
+                    gUiNameY = ny + 14;
+                    gUiNameW = 0x180;
+                    gUiNameH = 0x30;
+                    gUiNameIdx = idx;
+                } else {
+                    /* No overlay: print the name with the game's own font (its plain UI face), centred on the
+                       strip, in an opaque white with a drop shadow (the style is copied into the command). */
+                    FontStyle saved = gFontStyle;
+                    gFontStyle.align = FONT_ALIGN_CENTER;
+                    gFontStyle.color = 0xFFFFFFFF;
+                    gFontStyle.shadowMode = FONT_SHADOW_DROP;
+                    gFontStyle.shadowColor = 0xC0000000;
+                    gFontStyle.shadowDx = 1;
+                    gFontStyle.shadowDy = 1;
+                    Font_PrintAsciiAt(nx + 0x100, ny + (0x40 - Font_GetGlyphHeight()) / 2, gPortStageNames[idx]);
+                    gFontStyle = saved;
+                }
+            }
+        } else {
+            uv.y0 = (nameId % 4) * 0x40;
+            uv.y1 = uv.y0 + 0x40;
+            uv.unk10 = nameId / 4;
+            Flash_ClipSetUv(f, &ref, &uv);
+            Flash_ClipSetTex(f, &ref, uv.unk10);
+            if (sPortStageNameHidden) { /* back on a stage of the disc: its name clip was off for the added one */
+                Flash_ClipSetFlags(f, &ref, 2, 1);
+                sPortStageNameHidden = 0;
+            }
+        }
+    }
+#else
     Flash_ClipSetUv(f, &ref, &uv);
     Flash_ClipSetTex(f, &ref, uv.unk10);
+#endif
     Flash_FindLabel(f, NULL, "mc_map_mask", &ref);
     if (gCharSel->stage->mask != 0) {
         Flash_ClipSetFlags(f, &ref, 0x102, 1);
@@ -735,6 +986,90 @@ void CharSel_Draw(void) {
 
     uv.x0 = 0;
     uv.x1 = 0x200;
+#ifdef PORT
+    {
+        extern void Flash_ClipGetPos(MFlash *flash, MFlashRef *ref, s32 *x, s32 *y);
+        s32 bgm = gCharSel->bgmIds[gCharSel->stage->bgm];
+
+        if (bgm >= PORT_SONG_FIRST_OFFSET) {
+            s32 idx = bgm - PORT_SONG_FIRST_OFFSET;
+            s32 cx, cy, px, py;
+            /* Use the clip's real position: the game moves "mc_bgm_now" per screen (on the BGM select it is the
+               bottom bar; on the map select it sits over the reel) and the child carries its own offset. */
+            /* Which of the two name clips exists depends on the menu's state: "off" while the music line is not
+               being chosen, "on" while its list is open. The position is taken from the one that is there (an
+               empty reference leaves the coordinates as they were: taking "off" alone put the name at whatever
+               the stack held while the list was open, and it was not seen). */
+            s32 have = 0;
+            s32 shown = 0; /* one of the two name clips exists: this screen shows the music's name */
+            cx = 0;
+            cy = 0;
+            Flash_FindLabel(f, "mc_bgm_now", "mc_bgm_now_text_off", &ref);
+            if (ref.id >= 0) {
+                Flash_ClipGetPos(f, &ref, &cx, &cy);
+                have = 1;
+            }
+            Flash_ClipSetFlags(f, &ref, 2, 0);
+            Flash_FindLabel(f, "mc_bgm_now", "mc_bgm_now_text_on", &ref);
+            if (!have && ref.id >= 0) {
+                Flash_ClipGetPos(f, &ref, &cx, &cy);
+                shown = 1;
+            }
+            shown |= have;
+            Flash_ClipSetFlags(f, &ref, 2, 0);
+            sPortSongNameHidden = 1; /* the game's own name clips are off while an added song's name is shown */
+            Flash_FindLabel(f, NULL, "mc_bgm_now", &ref);
+            Flash_ClipGetPos(f, &ref, &px, &py);
+            if (!shown) {
+                /* (a screen of this menu without the music line: nothing to draw, as for the stage's name) */
+            } else if (gUiSongReady) {
+                /* The port draws the track's name (its own art) over the menu, at the clip's own place. */
+                gUiSongX = px + cx;
+                gUiSongY = py + cy;
+                gUiSongW = 0x200;
+                gUiSongH = 0x20;
+                gUiSongLit = !have; /* the "on" clip: the music list is open */
+                gUiSongIdx = idx;
+                {
+                    extern void Port_SongDebug(int state, int idx, int px, int py, int cx, int cy); /* headless.c */
+                    Port_SongDebug((int)gCharSel->stage->state, (int)idx, (int)px, (int)py, (int)cx, (int)cy);
+                }
+            } else if (idx >= 0 && idx < gPortSongCount) {
+                /* No overlay (the OpenGL back end has none yet): print the name with the game's own font. */
+                extern void Font_PrintAsciiAt(s32 x, s32 y, char *str);
+                extern s32 Font_GetGlyphHeight(void);
+                extern FontStyle gFontStyle;
+                FontStyle saved = gFontStyle;
+                gFontStyle.align = FONT_ALIGN_LEFT;
+                gFontStyle.color = 0xFFFFFFFF;
+                gFontStyle.shadowMode = FONT_SHADOW_DROP;
+                gFontStyle.shadowColor = 0xC0000000;
+                Font_PrintAsciiAt(px + cx, py + cy + (0x20 - Font_GetGlyphHeight()) / 2, gPortSongNames[idx]);
+                gFontStyle = saved;
+            }
+        } else {
+            uv.y0 = (bgm % 8) * 0x20;
+            uv.y1 = uv.y0 + 0x20;
+            uv.unk10 = bgm / 8;
+            Flash_FindLabel(f, "mc_bgm_now", "mc_bgm_now_text_off", &ref);
+            Flash_ClipSetUv(f, &ref, &uv);
+            Flash_ClipSetTex(f, &ref, uv.unk10);
+            if (sPortSongNameHidden) {
+                /* Back on a song of the disc after an added one: the clips that were switched off for the added
+                   song's name come back. (The game itself never switches them; without this the names stayed
+                   invisible while scrolling the list, until the menu's animation reset the clips.) */
+                Flash_ClipSetFlags(f, &ref, 2, 1);
+            }
+            Flash_FindLabel(f, "mc_bgm_now", "mc_bgm_now_text_on", &ref);
+            Flash_ClipSetUv(f, &ref, &uv);
+            Flash_ClipSetTex(f, &ref, uv.unk10);
+            if (sPortSongNameHidden) {
+                Flash_ClipSetFlags(f, &ref, 2, 1);
+                sPortSongNameHidden = 0;
+            }
+        }
+    }
+#else
     uv.y0 = (gCharSel->bgmIds[gCharSel->stage->bgm] % 8) * 0x20;
     uv.y1 = uv.y0 + 0x20;
     uv.unk10 = gCharSel->bgmIds[gCharSel->stage->bgm] / 8;
@@ -744,6 +1079,7 @@ void CharSel_Draw(void) {
     Flash_FindLabel(f, "mc_bgm_now", "mc_bgm_now_text_on", &ref);
     Flash_ClipSetUv(f, &ref, &uv);
     Flash_ClipSetTex(f, &ref, uv.unk10);
+#endif
 
     for (i = 0; i < CHARSEL_SIDES; i++) {
         f = &gCharSel->flash[3 + i];
@@ -863,14 +1199,26 @@ void CharSel_Draw(void) {
         }
     }
 
+#ifdef PORT
+    for (i = 0; i < CHARSEL_FLASH_NUM; i++) {
+        Port_MenuMovie(i == 1 || i == 2 ? i | 0x100 : i); /* widescreen menus: which of the screen's movies, the two
+                                                             rosters marked (port/src/gs_marker.c) */
+        Flash_Draw(&gCharSel->flash[i]);
+    }
+    Port_MenuMovie(0);
+#else
     for (i = 0; i < CHARSEL_FLASH_NUM; i++) {
         Flash_Draw(&gCharSel->flash[i]);
     }
+#endif
     Font_FlushAll();
     IconWin_Draw();
     ItemPanel_Draw(0);
     ItemPanel_Draw(1);
     ItemHelp_Draw(gCharSel->itemInfo);
+#ifdef PORT
+    Port_MenuPage(0);
+#endif
 }
 
 /* Advances the movies and the two side panels, and drops the "hidden" marks once the movies say so. */
@@ -919,6 +1267,23 @@ void CharSel_Update(void) {
    original loads the upper half of that string's address once, in front of the branch (its delay slot), and
    starts both arms with `move a1,a2`, while this compiles with `move a1,a2` in the delay slot and the `lui` at
    the start of each arm. Everything else, including every branch, is the original's code. */
+#ifdef PORT
+/* A lobby's match (port/src/gs/net_lobby.c): going back from the character select is its owner's way back to the
+   lobby (the session ends for everyone, as "Back to the Lobby" in a fight); the other player's triangle does
+   nothing there. The owner's side travels with the rules, so every copy decides the same. */
+static s32 CharSel_PortLobbyHold(s32 pad) {
+    extern int Port_NetSession(void);
+    extern int Port_NetLobbyOwnerSide(void);
+    s32 owner;
+
+    if (!Port_NetSession()) {
+        return 0;
+    }
+    owner = Port_NetLobbyOwnerSide();
+    return owner >= 0 && pad != owner;
+}
+#endif
+
 void CharSel_Input(s32 *running) {
     s32 count = 0;
     s32 i;
@@ -1070,7 +1435,7 @@ void CharSel_Input(s32 *running) {
                     CharSel_ClipGoto(0, 0, CHARSEL_CLIP_STAGE_CHIP, "fl_on_start");
                     gCharSel->stage->bgmPlaying = gCharSel->stage->bgm;
                     if (gCharSel->bgmIds[gCharSel->stage->bgmPlaying] != CHARSEL_BGM_RANDOM) {
-                        Bgm_Play(CHARSEL_BGM_FIRST + gCharSel->bgmIds[gCharSel->stage->bgmPlaying]);
+                        Bgm_Play(CHARSEL_BGM_FILE(gCharSel->bgmIds[gCharSel->stage->bgmPlaying]));
                     }
                     gCharSel->stage->state = CHARSEL_ST_STAGE;
                     Snd_PlaySe(1, 1);
@@ -1206,6 +1571,12 @@ void CharSel_Input(s32 *running) {
                         }
                     }
                 } else {
+#ifdef PORT
+                    if (CharSel_PortLobbyHold(i)) { /* a lobby's match: only its owner leaves the select */
+                        Snd_PlaySe(1, 2);
+                        break;
+                    }
+#endif
                     ColorFade_StartOut(0, 0, 0, 20);
                     *running = 0;
                 }
@@ -1549,6 +1920,14 @@ extern void BattleSetup_SetMember(s32 sideNo, s32 idx, s32 chara, s32 costume, s
 extern void BattleSetup_Finish(void);
 extern s32 CpuLevel_FromSetting(u32 setting);
 
+/* The song a chosen "random" stands for: one of the nine battle songs. PC build, with songs added from outside
+   the disc: any entry of the music list before "random", the disc's and the added ones alike. */
+#ifdef PORT
+#define CHARSEL_RANDOM_BGM() (sPortSongsAdded ? gCharSel->bgmIds[Rand_Range(gCharSel->bgmCount - 1)] : Rand_Range(9) + 8)
+#else
+#define CHARSEL_RANDOM_BGM() (Rand_Range(9) + 8)
+#endif
+
 /* Runs the screen. Returns 0 when it was cancelled, otherwise non-zero with the battle set up. */
 s32 CharSel_Run(s32 section) {
     s32 result = 1;
@@ -1608,6 +1987,17 @@ s32 CharSel_Run(s32 section) {
         s32 flag[2] = { 1, 1 };
         s32 mode;
 
+#ifdef PORT
+        /* PC build: "random" also draws the stages added from outside the disc. The game's own draw leaves out the
+           list's last entry (its "random") and anything numbered from "random" up, which is every added stage; with
+           stages added the whole list is drawn from, and only "random" itself and the locked / empty markers are
+           drawn again. With nothing added (and in an online session, where nothing is) the draw is the game's. */
+        if (gCharSel->stage->stage == CHARSEL_STAGE_RANDOM && sPortStagesAdded) {
+            do {
+                gCharSel->stage->stage = gCharSel->stageIds[Rand_Range(gCharSel->stageCount)];
+            } while (gCharSel->stage->stage == CHARSEL_STAGE_RANDOM || gCharSel->stage->stage >= STGGRID_ID_LOCKED);
+        }
+#endif
         if (gCharSel->stage->stage == CHARSEL_STAGE_RANDOM) {
             do {
                 gCharSel->stage->stage = gCharSel->stageIds[Rand_Range(gCharSel->stageCount - 1)];
@@ -1618,7 +2008,7 @@ s32 CharSel_Run(s32 section) {
             bgm = gCharSel->bgmIds[gCharSel->stage->bgmPlaying];
             screenMode = 0;
             if (bgm == CHARSEL_BGM_RANDOM) {
-                bgm = Rand_Range(9) + 8;
+                bgm = CHARSEL_RANDOM_BGM();
             }
             announcer = 1;
             timeLimit = 0;
@@ -1632,7 +2022,7 @@ s32 CharSel_Run(s32 section) {
             bgm = gCharSel->bgmIds[gCharSel->stage->bgmPlaying];
             screenMode = gCharSel->players == 1;
             if (bgm == CHARSEL_BGM_RANDOM) {
-                bgm = Rand_Range(9) + 8;
+                bgm = CHARSEL_RANDOM_BGM();
             }
             switch (gSaveData->rule[0]) {
             case 0:

@@ -53,6 +53,19 @@ static struct {
     uint32_t top, tops, base, ofst, dbf, itop, itops, mode, mask, cl, wl, row[4], col[4];
 } vu;
 
+/* See Gs_StateKeep (gs_core.c): the vertex unit's memory and loaded programs, kept (0) or brought back (1). */
+void GsVu1_StateKeep(int restore) {
+    static unsigned char *kept;
+    if (!restore) {
+        if (kept == NULL) {
+            kept = malloc(sizeof(vu));
+        }
+        memcpy(kept, &vu, sizeof(vu));
+    } else if (kept != NULL) {
+        memcpy(&vu, kept, sizeof(vu));
+    }
+}
+
 static unsigned sUnknown[2][128];
 static unsigned sStatRuns, sStatInstr, sStatKicks;
 static unsigned sProgSize;
@@ -262,6 +275,45 @@ __attribute__((hot)) void GsVu1_Unpack(uint32_t cmd, uint32_t num, uint32_t imm,
         lz_all();
     }
 #endif
+    /* The usual case by far (every vertex of every model): no mask, no row arithmetic, consecutive vectors. The
+       same result as the general loop below, one tight loop per format. */
+    if (!masked && vu.mode == 0 && cl == wl && !(vn == 3 && vl == 3) && vn != 0 && vl != 3) {
+        uint32_t comps = vn + 1;
+        if (vn == 3 && vl == 0) { /* four words per vector, which is all the game's models and effects send: a copy */
+            for (k = 0; k < n; k++) {
+                uint32_t at = (addr + k) & 0x3FF, run = 0x400 - at;
+                if (run > n - k) {
+                    run = n - k;
+                }
+                memcpy(&vu.mem[at * 16], src + k * 16, run * 16);
+                k += run - 1;
+            }
+            return;
+        }
+        for (k = 0; k < n; k++) {
+            uint32_t out[4] = {0, 0, 0, 0};
+            if (vl == 0) {
+                for (c = 0; c < comps; c++) {
+                    memcpy(&out[c], src + c * 4, 4);
+                }
+                src += comps * 4;
+            } else if (vl == 1) {
+                for (c = 0; c < comps; c++) {
+                    uint16_t w;
+                    memcpy(&w, src + c * 2, 2);
+                    out[c] = usn ? (uint32_t)w : (uint32_t)(int32_t)(int16_t)w;
+                }
+                src += comps * 2;
+            } else {
+                for (c = 0; c < comps; c++) {
+                    out[c] = usn ? (uint32_t)src[c] : (uint32_t)(int32_t)(int8_t)src[c];
+                }
+                src += comps;
+            }
+            memcpy(&vu.mem[((addr + k) & 0x3FF) * 16], out, 16);
+        }
+        return;
+    }
     for (k = 0; k < n; k++) {
         uint32_t v[4] = {0, 0, 0, 0}, out[4];
         int have = !(wl > cl && cyc >= cl); /* filling write: vectors beyond CL come from the registers only */
@@ -928,6 +980,13 @@ __attribute__((hot)) void GsVu1_Call(int addr) {
         }
     }
 #endif
+    if (GS_NO_PICTURE) {
+        /* A frame that is only being re-run (rollback, an online session's silent start-up): the program is not
+           run. A vertex program's whole output is primitives for the GS, none of which would be drawn; what a
+           later frame's programs need (their code, the data unpacked for them, the registers above) is kept up
+           by the rest of the list, which is still walked. */
+        return;
+    }
     if (getenv("BT3_VU_DUMP") != NULL && (int)gGsFrame == atoi(getenv("BT3_VU_DUMP")) && sProgSize == 127) {
         static int shown;
         if (shown < 3 && addr < 0) {

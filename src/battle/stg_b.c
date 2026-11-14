@@ -41,7 +41,9 @@ void *memset(void *, s32, u32);
 
 extern StgAmb gStgAmb;
 
-void sceGsSetDefStoreImage(void *sp, s16 sbp, s16 sbw, s16 spsm, s16 x, s16 y, s16 w, s16 h);
+/* Returns int as in the SDK: with `void` the first call of ScrXfade_StoreHalf does not set v0 and the scheduler
+   orders the instructions in front of it differently. */
+s32 sceGsSetDefStoreImage(void *sp, s16 sbp, s16 sbw, s16 spsm, s16 x, s16 y, s16 w, s16 h);
 s32 sceGsExecStoreImage(void *sp, void *dst);
 void FlushCache(s32 mode);
 void GfxClut_InitPacket(void *tex, u16 arg);
@@ -1008,7 +1010,6 @@ void ScrXfade_Capture(void) {
 }
 
 /* Reads w x h pixels at frame block `sbp` into buffer `index` and builds the packet that uploads them again. */
-#if 0 /* 4 of 121 instructions differ: before the first call the original emits `sra a1,a0,16` / `move a0,sp` ahead of the two `addu` that form p and e; this C emits the two `addu` first. Everything else is identical. Second cleanup, about 30 more variants, none changed the four instructions: declaration / assignment order of p, e, tag; xf as a local or gScrXfade at each use; `&xf->chain[index]` (53 differ); sbp as s32 with a cast at the call, a local copy of sbp or si; other prototypes for sceGsSetDefStoreImage; `&p[14]` for the image address; p or e assigned after the call (34+ differ). In the second scheduling pass the two `addu` and the two argument loads have equal priority, so the order comes from the first pass, where this C schedules the `addu` of p early (it feeds the load of buf[index], which is on the path to sceGsExecStoreImage); the original must have had that chain one step shorter or the argument chain one step longer. */
 void ScrXfade_StoreHalf(s16 sbp, u16 w, u16 h, s32 index) {
     u8 si[0x70];
     ScrXfade *xf = gScrXfade;
@@ -1062,9 +1063,6 @@ void ScrXfade_StoreHalf(s16 sbp, u16 w, u16 h, s32 index) {
     p[1] = GS_TEXFLUSH;
     p[0] = 0;
 }
-#else
-INCLUDE_ASM("asm/nonmatchings/battle/stg_b", ScrXfade_StoreHalf);
-#endif
 
 /* Uploads the captured halves as a 512 x 448 texture at block `tbp` and draws it over the frame. */
 void ScrXfade_Draw(s32 unused, s32 tbp, u8 alpha) {
@@ -1647,6 +1645,13 @@ void StgFog_ResetColor(void) {
    s7 by local allocation; 0xE re-materialised twice). With literals, or with only some of the four as
    variables, the same instructions come out in another schedule (88 of 230). The TEX0 word is
    `tbp | fbw << 14 | tw << 26 | th << 30` in that order, with tw declared before th. */
+#ifdef PORT
+extern void Port_GsMarker(s32 effect); /* port/src/gs_marker.c */
+/* The PC renderer draws page 0x150 at the PS2's resolution between these (gs_draw.c target_lowres): the blur is the
+   half-size copy stretched back, and at a higher internal resolution the copy kept the detail and blurred nothing. */
+#define PORT_LOWRES_BEGIN 0x20
+#define PORT_LOWRES_END 0x21
+#endif
 void StgFog_Draw(void) {
     StgFog *tone = gStgFog;
     u64 *p;
@@ -1655,6 +1660,9 @@ void StgFog_Draw(void) {
     s32 srcH = 0x1C0;
     s32 h = 0xE0;
 
+#ifdef PORT
+    Port_GsMarker(PORT_LOWRES_BEGIN);
+#endif
     Dma_AddData(tone->load, 0x10);
     Dma_AddTexFlush();
     Dma_AddFrame(!(gGfx.frame & 1) ? 0x70 : 0, 8, 0xFFFFFF);
@@ -1704,6 +1712,9 @@ void StgFog_Draw(void) {
         Dma_PutTexStrips((GsQword **)&p, 0, 0, width, srcH, 0, 0, 0, 0, half, h, 8, 8, 0x80808080, 1);
         Dma_EndDirect(p);
     }
+#ifdef PORT
+    Port_GsMarker(PORT_LOWRES_END);
+#endif
 }
 
 /* Takes the three control points from the stage's parameters (defaults when NULL) and rebuilds the table. */

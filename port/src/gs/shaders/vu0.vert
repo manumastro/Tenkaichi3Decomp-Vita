@@ -19,8 +19,9 @@ layout(set = 1, binding = 0) uniform U {
     mat4 screen;         // 14..17
     vec4 light;          // xyz: the x components of 10..12, w: of 13
     vec4 color0, color1; // 22, 23 (0..255)
-    vec4 misc;           // x, y: XYOFFSET in pixels, z: depth maximum, w: layer (0 or 1; 2 = programs 2a / 2b; 3 = program 8; 4 = program 7; 5 = program 1 layer 1)
+    vec4 misc;           // x, y: XYOFFSET in pixels, z: depth maximum, w: layer (0 or 1; 2 = programs 2a / 2b; 3 = program 8; 4 = program 7; 5 = program 1 layer 1; 6 = the rim light)
     vec4 light2;         // program 1: the y components of 10..13
+    vec4 target;         // x: GS pixels per texel of the target (gs_draw.c target_lowres; 0 = 1)
 } u;
 void main() {
     float w = u.misc.w == 4.0 ? 1.0 : inPos.w; // layer 4 (debris, rigid): the 4th word is a flag, not a weight
@@ -30,12 +31,17 @@ void main() {
     // Programs 2a / 2b: the shadow camera's matrix is orthographic with a NEGATIVE constant w (measured: -862).
     // The PS2 only divides by it; a GPU would clip everything as "behind the eye". The same point with w > 0:
     if (u.misc.w == 2.0 && s.w < 0.0) s = -s;
-    gl_Position = vec4((s.x - u.misc.x * s.w) / 512.0 - s.w, s.w - (s.y - u.misc.y * s.w) / 512.0, s.z / u.misc.z, s.w);
+    float tx = u.target.x > 0.0 ? 512.0 * u.target.x : 512.0; // (a work buffer at the PS2's resolution: its corner)
+    gl_Position = vec4((s.x - u.misc.x * s.w) / tx - s.w, s.w - (s.y - u.misc.y * s.w) / tx, s.z / abs(u.misc.z), s.w);
+    // The vertex program hands the GS a whole-number depth (it converts s.z / s.w to an integer), and the GS
+    // compares whole numbers at every pixel (gs.frag). Here: that whole number plus a half, so that what is
+    // interpolated between vertices never sits on the edge between two whole numbers.
+    if (s.w > 0.0 && u.misc.z > 0.0) gl_Position.z = (floor(s.z / s.w) + 0.5) / u.misc.z * s.w; // (misc.z < 0: BT3_DEPTH_FRAC, depth with its fractions as before)
     if (u.misc.w == 2.0) {
         // programs 2a / 2b (flat-colour model for the shadow): their "screen" matrix is the shadow camera's, whose
         // depth is not kept inside the depth range; the PS2 just stores whatever integer comes out. Keep every
         // triangle: depth clamped into range instead of clipped.
-        gl_Position.z = clamp(s.z / u.misc.z, 0.0, s.w);
+        gl_Position.z = clamp(s.z / abs(u.misc.z), 0.0, s.w);
     }
     if (u.misc.w == 5.0) {
         // program 1, layer 1: the model's second texture looked up by the direction of the normal in a
@@ -43,6 +49,16 @@ void main() {
         vec4 n1 = vec4(inNormal.xyz, 1.0);
         vColor = u.color1 / 255.0;
         vStq = vec3(dot(u.light, n1) * 0.5 + 0.5, dot(u.light2, n1) * 0.5 + 0.5, 1.0);
+    } else if (u.misc.w == 6.0) {
+        // PC only (gs_draw.c, a script mod's rim light): light added along the silhouette's edges, where the surface
+        // turns away from the camera, more on the side facing the light. light2: its colour (0..255) and strength.
+        vec3 n = normalize(mix(mat3(u.boneB) * inNormal.xyz, mat3(u.boneA) * inNormal.xyz, w));
+        vec3 fwd = normalize(vec3(u.screen[0][3], u.screen[1][3], u.screen[2][3])); // (the camera's forward: the w row)
+        float edge = pow(clamp(1.0 - abs(dot(n, fwd)), 0.0, 1.0), 2.6);
+        float lit = length(u.light.xyz) > 0.0 ? clamp(dot(n, normalize(u.light.xyz)), 0.0, 1.0) : 0.5;
+        float a = clamp(edge * (0.35 + 0.65 * lit) * u.light2.w, 0.0, 1.0);
+        vColor = vec4(u.light2.rgb / 255.0, a * 128.0 / 255.0); // (alpha as the GS has it: 0x80 = 1)
+        vStq = vec3(0.0, 0.0, 1.0);
     } else if (u.misc.w >= 3.0) {
         // programs 8 and 7: the colour of each vertex (0..255 floats in the second quadword); 7 takes the mesh's alpha
         vColor = clamp(floor(vec4(inNormal.rgb, u.misc.w == 4.0 ? u.color0.a : inNormal.a)), 0.0, 255.0) / 255.0;

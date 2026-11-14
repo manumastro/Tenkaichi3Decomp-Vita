@@ -7,43 +7,148 @@
 /* Windows: the exception code, the faulting address and the return addresses on the stack. The program is linked
    at a fixed address (0x20000000), so the numbers can be looked up in bt3.exe.map of the same build. */
 #include <windows.h>
+#include <io.h>
+#include <wchar.h>
+#include <stdint.h>
 #include <stdio.h>
+extern const char *Port_DataSummary(void); /* plat_verify.c */
 
-static LONG WINAPI on_crash(EXCEPTION_POINTERS *e) {
-    void *frames[48];
-    USHORT n = RtlCaptureStackBackTrace(0, 48, frames, NULL), i;
-    int k;
+extern const char *volatile gPortStage; /* plat_mem.c: how far the start got */
 
+/* The report is written with the system's own file calls and no C library (the crash may be inside it), from a
+   VECTORED handler: those are called first, before the system checks the stack, so a crash on a stack the system
+   does not like (the game runs on its own stack below 4 GB) is still reported. The handler only reports; what
+   happens to the exception afterwards is unchanged. */
+static HANDLE sCrashOut[2];
+
+static void crash_put(const char *s) {
+    DWORD n = 0, done, k;
+    while (s[n] != '\0') {
+        n++;
+    }
     for (k = 0; k < 2; k++) {
-        FILE *out = k == 0 ? stderr : fopen("bt3_crash.txt", "w");
-        if (out == NULL) {
-            continue;
-        }
-        fprintf(out, "bt3: crashed: exception %08lX at %p", (unsigned long)e->ExceptionRecord->ExceptionCode, e->ExceptionRecord->ExceptionAddress);
-        if (e->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && e->ExceptionRecord->NumberParameters >= 2) {
-            fprintf(out, " (%s address %p)", e->ExceptionRecord->ExceptionInformation[0] ? "writing" : "reading",
-                    (void *)e->ExceptionRecord->ExceptionInformation[1]);
-        }
-        fprintf(out, "\nbacktrace (innermost first; addresses of bt3.exe, see bt3.exe.map):\n");
-        for (i = 0; i < n; i++) {
-            fprintf(out, "%p\n", frames[i]);
-        }
-        if (k == 1) {
-            fclose(out);
-            fprintf(stderr, "bt3: the same report is in bt3_crash.txt\n");
+        if (sCrashOut[k] != NULL && sCrashOut[k] != INVALID_HANDLE_VALUE) {
+            WriteFile(sCrashOut[k], s, n, &done, NULL);
         }
     }
-    return EXCEPTION_EXECUTE_HANDLER;
 }
 
-__attribute__((constructor)) static void crash_init(void) {
+static void crash_hex(unsigned long long v) {
+    char b[20];
+    int i;
+    b[0] = '0'; b[1] = 'x';
+    for (i = 0; i < 16; i++) {
+        b[2 + i] = "0123456789ABCDEF"[(v >> (60 - i * 4)) & 15];
+    }
+    b[18] = '\0';
+    crash_put(b);
+}
+
+/* " (in <module file> + offset)" for an address */
+static void crash_where(void *addr) {
+    HMODULE m = NULL;
+    char name[MAX_PATH];
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)addr, &m) && m != NULL &&
+        GetModuleFileNameA(m, name, sizeof(name)) != 0) {
+        crash_put(" (");
+        crash_put(name);
+        crash_put(" + ");
+        crash_hex((unsigned long long)((char *)addr - (char *)m));
+        crash_put(")");
+    }
+}
+
+static LONG WINAPI on_crash(EXCEPTION_POINTERS *e) {
+    static LONG once;
+    DWORD code = e->ExceptionRecord->ExceptionCode;
+    NT_TIB *tib = (NT_TIB *)NtCurrentTeb();
+    void *frames[32];
+    USHORT n, i;
+
+    if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_ILLEGAL_INSTRUCTION && code != EXCEPTION_STACK_OVERFLOW &&
+        code != EXCEPTION_INT_DIVIDE_BY_ZERO && code != EXCEPTION_PRIV_INSTRUCTION && code != EXCEPTION_IN_PAGE_ERROR) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    if (InterlockedExchange(&once, 1) != 0) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    sCrashOut[0] = GetStdHandle(STD_ERROR_HANDLE);
+    sCrashOut[1] = CreateFileA("bt3_crash.txt", GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    crash_put("bt3: crashed: exception ");
+    crash_hex(code);
+    crash_put(" at ");
+    crash_hex((unsigned long long)(uintptr_t)e->ExceptionRecord->ExceptionAddress);
+    crash_where(e->ExceptionRecord->ExceptionAddress);
+    if (code == EXCEPTION_ACCESS_VIOLATION && e->ExceptionRecord->NumberParameters >= 2) {
+        crash_put(e->ExceptionRecord->ExceptionInformation[0] == 1 ? "\r\nwriting address " : e->ExceptionRecord->ExceptionInformation[0] == 8 ? "\r\nexecuting address " : "\r\nreading address ");
+        crash_hex(e->ExceptionRecord->ExceptionInformation[1]);
+    }
+    crash_put("\r\nlast step reached: ");
+    crash_put(gPortStage);
+#ifdef __x86_64__
+    crash_put("\r\nrsp "); crash_hex(e->ContextRecord->Rsp);
+    crash_put(" rbp "); crash_hex(e->ContextRecord->Rbp);
+    crash_put("\r\nrax "); crash_hex(e->ContextRecord->Rax);
+    crash_put(" rbx "); crash_hex(e->ContextRecord->Rbx);
+    crash_put(" rcx "); crash_hex(e->ContextRecord->Rcx);
+    crash_put(" rdx "); crash_hex(e->ContextRecord->Rdx);
+    crash_put("\r\nrsi "); crash_hex(e->ContextRecord->Rsi);
+    crash_put(" rdi "); crash_hex(e->ContextRecord->Rdi);
+    crash_put(" r8 "); crash_hex(e->ContextRecord->R8);
+    crash_put(" r9 "); crash_hex(e->ContextRecord->R9);
+#endif
+    crash_put("\r\nthread stack as the system knows it: ");
+    crash_hex((unsigned long long)(uintptr_t)tib->StackLimit);
+    crash_put(" to ");
+    crash_hex((unsigned long long)(uintptr_t)tib->StackBase);
+    if (Port_DataSummary()[0] != '\0') { /* (plat_verify.c: not the original disc's data) */
+        crash_put("\r\n");
+        crash_put(Port_DataSummary());
+    }
+    crash_put("\r\nbacktrace (innermost first; addresses in Tenkaichi3Decomp.exe are looked up in the build's map file):\r\n");
+    n = RtlCaptureStackBackTrace(0, 32, frames, NULL);
+    for (i = 0; i < n; i++) {
+        crash_hex((unsigned long long)(uintptr_t)frames[i]);
+        crash_where(frames[i]);
+        crash_put("\r\n");
+    }
+    crash_put("bt3: the same report is in bt3_crash.txt\r\n");
+    if (sCrashOut[1] != INVALID_HANDLE_VALUE) {
+        CloseHandle(sCrashOut[1]);
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+/* (priority 101: before the other start-up code of the port, which reads the game data and reserves memory) */
+__attribute__((constructor(101))) static void crash_init(void) {
     /* The program is a window program (no console window of its own). Started from a terminal, its messages go
        to that terminal; started by the setup with a pipe, the pipe is kept. */
     if (GetStdHandle(STD_OUTPUT_HANDLE) == NULL && AttachConsole(ATTACH_PARENT_PROCESS)) {
         freopen("CONOUT$", "w", stdout);
         freopen("CONOUT$", "w", stderr);
+    } else if (GetStdHandle(STD_ERROR_HANDLE) == NULL) {
+        /* Started from the Explorer or a shortcut: no terminal and no pipe, and what the program says would be lost.
+           It goes to bt3_log.txt next to the program instead (the run before kept as bt3_log_prev.txt), so that a
+           report can carry it. Nothing when that folder cannot be written. */
+        wchar_t path[MAX_PATH + 32], prev[MAX_PATH + 32];
+        DWORD n = GetModuleFileNameW(NULL, path, MAX_PATH);
+        while (n > 0 && path[n - 1] != L'\\' && path[n - 1] != L'/') {
+            n--;
+        }
+        if (n > 0) {
+            wcscpy(path + n, L"bt3_log.txt");
+            wcscpy(prev, path);
+            wcscpy(prev + n, L"bt3_log_prev.txt");
+            MoveFileExW(path, prev, MOVEFILE_REPLACE_EXISTING);
+            if (_wfreopen(path, L"w", stderr) != NULL) {
+                _dup2(_fileno(stderr), _fileno(stdout));
+            }
+        }
     }
-    SetUnhandledExceptionFilter(on_crash);
+    /* nothing held back in a buffer: what was printed before a crash is in the log */
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
+    AddVectoredExceptionHandler(1, on_crash);
 }
 #else
 #include <execinfo.h>
@@ -52,10 +157,32 @@ __attribute__((constructor)) static void crash_init(void) {
 #include <string.h>
 #include <unistd.h>
 
+extern const char *Port_DataSummary(void); /* plat_verify.c */
+
 static void put(int fd, const char *s) {
     if (write(fd, s, strlen(s)) < 0) {
     }
 }
+
+#ifdef __APPLE__
+/* macOS: the address that was reached, and the same as a game address (port_addr.h): a game address used without
+   its conversion shows here as an address below 4 GB, which macOS never maps. */
+#include "port_addr.h"
+#include <sys/ucontext.h>
+static void *sFault;
+static ucontext_t *sCtx;
+static void put_hex(int fd, unsigned long long v) {
+    char b[19];
+    int i;
+    b[0] = '0';
+    b[1] = 'x';
+    for (i = 0; i < 16; i++) {
+        b[2 + i] = "0123456789abcdef"[(v >> (60 - 4 * i)) & 15];
+    }
+    b[18] = '\0';
+    put(fd, b);
+}
+#endif
 
 static void on_crash(int sig) {
     void *frames[48];
@@ -70,6 +197,33 @@ static void on_crash(int sig) {
         }
         put(out, "bt3: crashed: ");
         put(out, name);
+        if (Port_DataSummary()[0] != '\0') { /* (plat_verify.c: not the original disc's data) */
+            put(out, "\n");
+            put(out, Port_DataSummary());
+        }
+#ifdef __APPLE__
+        put(out, "\naddress ");
+        put_hex(out, (unsigned long long)(uintptr_t)sFault);
+        put(out, " (game address ");
+        put_hex(out, (unsigned long long)(uint32_t)((uintptr_t)sFault - PORT_WINDOW));
+        put(out, ")");
+        if (sCtx != NULL) { /* the registers when it happened: pc is the instruction (the backtrace starts above it) */
+            int r;
+            put(out, "\npc ");
+            put_hex(out, sCtx->uc_mcontext->__ss.__pc);
+            put(out, " lr ");
+            put_hex(out, sCtx->uc_mcontext->__ss.__lr);
+            put(out, " sp ");
+            put_hex(out, sCtx->uc_mcontext->__ss.__sp);
+            for (r = 0; r < 29; r++) {
+                put(out, r % 4 == 0 ? "\n" : " ");
+                put(out, "x");
+                put(out, (const char[]){(char)('0' + r / 10), (char)('0' + r % 10), 0});
+                put(out, " ");
+                put_hex(out, sCtx->uc_mcontext->__ss.__x[r]);
+            }
+        }
+#endif
         put(out, "\nbacktrace (innermost first):\n");
         backtrace_symbols_fd(frames, n, out);
     }
@@ -81,12 +235,28 @@ static void on_crash(int sig) {
     raise(sig);
 }
 
+#ifdef __APPLE__
+static void on_crash_info(int sig, siginfo_t *si, void *ctx) {
+    sCtx = (ucontext_t *)ctx;
+    sFault = si->si_addr;
+    on_crash(sig);
+}
+#endif
+
 __attribute__((constructor)) static void crash_init(void) {
     static const int sigs[] = {SIGSEGV, SIGFPE, SIGILL, SIGBUS, SIGABRT};
     unsigned i;
 
     for (i = 0; i < sizeof(sigs) / sizeof(sigs[0]); i++) {
+#ifdef __APPLE__
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_sigaction = on_crash_info;
+        sa.sa_flags = SA_SIGINFO;
+        sigaction(sigs[i], &sa, NULL);
+#else
         signal(sigs[i], on_crash);
+#endif
     }
 }
 #endif

@@ -128,8 +128,8 @@ extern void HudPrompt_Term(void);
 extern void HudPrompt_Reset(void);
 extern void HudPrompt_SelectSide(s32 side);                    /* select the side */
 extern void HudPrompt_SetButton(s32 side, s32 button, s32 arg);
-#ifdef PORT_VITA
-extern int Port_ClashSquare(void); /* port/vita/vita_gfx.c */
+#ifdef PORT
+extern int Port_ClashSquare(void), Port_NetActive(void), Port_NetMe(void); /* port/src/gs */
 #endif
 extern void HudPrompt_SetCommand(s32 side, s32 count, s32 *buttons, s32 *kinds, s32 idx);
 extern void HudPrompt_ClearCommand(s32 side);
@@ -177,6 +177,16 @@ void HudNode_Update(HudNode *node) {
 #define PORT_2D_CENTER 0x12
 #define PORT_2D_END 0x13
 #define PORT_2D_BY_POS 0x14
+#define PORT_2D_NOTICE 0x18
+/* the gauges with the faces, the timer, the combo counter with its messages: begin / end, so that a HUD drawn by the
+   port (the script mods' hud.hide_game, port/src/gs/mods.c) can stand in for them; the renderer then leaves them out
+   of the picture (port/src/gs/gs_draw.c). The game builds and runs its HUD as ever. */
+#define PORT_HUD_GAUGE_BEGIN 0x72
+#define PORT_HUD_GAUGE_END 0x73
+#define PORT_HUD_TIMER_BEGIN 0x74
+#define PORT_HUD_TIMER_END 0x75
+#define PORT_HUD_COMBO_BEGIN 0x76
+#define PORT_HUD_COMBO_END 0x77
 extern void Port_GsMarker(s32 effect);
 #endif
 
@@ -190,11 +200,23 @@ void HudNode_Draw(HudNode *node, s32 mirror) {
         return;
     }
 #ifdef PORT
-    if (node == gHud->timer || node == gHud->notice) {
-        Port_GsMarker(PORT_2D_CENTER); /* the parts without a side */
+    if (node == gHud->timer) {
+        Port_GsMarker(PORT_2D_CENTER);
+    }
+    if (node == gHud->notice) {
+        Port_GsMarker(PORT_2D_NOTICE); /* the announcement's word, mask, streak and fragments share one scale */
     }
     if (node == gHud->caption) {
         Port_GsMarker(PORT_2D_BY_POS); /* captions (technique names) appear on either side: the side they are on */
+    }
+    if (node == gHud->gauge) {
+        Port_GsMarker(PORT_HUD_GAUGE_BEGIN);
+    }
+    if (node == gHud->timer) {
+        Port_GsMarker(PORT_HUD_TIMER_BEGIN);
+    }
+    if (node == gHud->combo) {
+        Port_GsMarker(PORT_HUD_COMBO_BEGIN);
     }
 #endif
     Vu0Cur_Push();
@@ -223,6 +245,20 @@ void HudNode_Draw(HudNode *node, s32 mirror) {
         HudNode_Draw(node->children[i], (mirror || (node->flags & HUD_NODE_MIRROR)) ? 1 : 0);
     }
     Vu0Cur_Pop();
+#ifdef PORT
+    if (node == gHud->notice) {
+        Port_GsMarker(PORT_2D_CENTER);
+    }
+    if (node == gHud->gauge) {
+        Port_GsMarker(PORT_HUD_GAUGE_END);
+    }
+    if (node == gHud->timer) {
+        Port_GsMarker(PORT_HUD_TIMER_END);
+    }
+    if (node == gHud->combo) {
+        Port_GsMarker(PORT_HUD_COMBO_END);
+    }
+#endif
 }
 
 /* Sets how a replay shows the HUD (see Hud_Draw). */
@@ -436,11 +472,12 @@ void Hud_PreUpdate(void) {
                 button = tbl[button];
                 button += kindOfs[kind] * 4;
                 HudPrompt_SetButton(side, button, n / 4);
-#ifdef PORT_VITA
-            /* Vita, "Clashes: Square" (port/vita/vita_gfx.c, after z3xox's PC build): the prompt of a clash is then the
-               game's own "press this button again and again" (as when ki has run out) with Square, not the turning
-               stick */
-            } else if (Port_ClashSquare() && (BtlCtrl_TestFlagE6Pad1(side) || BtlCtrl_TestFlagE6Pad(side, &pad))) {
+#ifdef PORT
+            /* PC build, "Clashes: Square counts as a direction": the prompt of a clash is then the game's own
+               "press this button again and again" (as when ki has run out) with Square, not the turning stick.
+               In an online match only on this player's own side. */
+            } else if (Port_ClashSquare() && (!Port_NetActive() || Port_NetMe() == side) &&
+                       (BtlCtrl_TestFlagE6Pad1(side) || BtlCtrl_TestFlagE6Pad(side, &pad))) {
                 HudPrompt_SetButton(side, 1, 0); /* icon 1 = Square, style 0 = pressed and released */
 #endif
             } else if (BtlCtrl_TestFlagE6Pad1(side)) {
@@ -752,5 +789,12 @@ void Hud_Draw(void) {
             HudNode_Draw(gHud->notice, 0);
         }
     }
+#ifdef PORT
+    {
+        extern void PortTbo_SparSign(void); /* menu/port_tbo.c: Train While Waiting's sign over its sparring fight */
+
+        PortTbo_SparSign();
+    }
+#endif
     Hud_ClearTexMarks();
 }

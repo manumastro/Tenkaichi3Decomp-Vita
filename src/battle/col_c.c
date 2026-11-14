@@ -102,6 +102,9 @@ extern void Heap_Free(void *ptr);
 extern void *memset(void *dst, s32 value, u32 size);
 extern void Tex_Upload(FontTex *tex, u32 tbp, s32 cbp); /* uploads a texture and its CLUT */
 extern void TexFile_UploadAll(void *res, void *tex, void *tex2);
+#ifdef PORT
+extern const u16 *UiText_TranslateString(const u16 *original);
+#endif
 
 /* 0x239BB0..0x239EA0, defined above with the first part's types. */
 #define Font_IsInClip ((s32 (*)(FontCmd *cmd, s32 x0, s32 y0, s32 x1, s32 y1))Font_IsInClip) /* 1 when the box touches the command's clip box */
@@ -191,6 +194,14 @@ u64 Font_MakeTex0(FontSlot *slot, s32 clut) {
 
 /* Uploads a font's texture to its VRAM blocks. */
 void Font_UploadTexture(FontSlot *slot) {
+#ifdef PORT
+    {
+        /* PC build: the renderer is told which glyph lies where in this texture, for the "Dialogue / UI font"
+           setting (port/src/gs/menu_text.c keeps a copy on its own side; nothing of the game is changed). */
+        extern void MenuText_RegisterGlyphs(int tbp, int cbp, const void *glyphs, int count, int lineHeight);
+        MenuText_RegisterGlyphs(slot->tbp, slot->cbp, slot->data->glyphs, slot->data->glyphCount, slot->lineHeight);
+    }
+#endif
     Tex_Upload(slot->data->tex, slot->tbp, slot->cbp);
 }
 
@@ -281,6 +292,14 @@ void Font_FlushAll(void) {
     Font_Flush(0);
 }
 
+#ifdef PORT
+/* Widescreen menus: the part of the screen (port/src/gs_marker.c) each queued command was made in, so that text
+   drawn when the queue is flushed, after the whole screen, keeps to the clip it belongs to */
+#define FONT_PART_MAX 4096
+static signed char sFontPart[FONT_PART_MAX];
+extern int Port_MenuPartNow(void);
+extern int Port_MenuPart(int part);
+#endif
 /* Matches only with Font_BeginPacket and Font_EndPacket DEFINED above it in the same file (otherwise the back
  * branch of the last loop comes out `bnezl` instead of `bnez`): evidence that the object starts at 0x239BB0. */
 /* Draws the queued commands from index first on, then truncates the queue to first and homes the cursor. */
@@ -308,6 +327,28 @@ void Font_Flush(s32 first) {
         }
         Font_BeginPacket(&pkt);
         cmd = &gFontCmds[first];
+#ifdef PORT
+        {
+            int partWas = Port_MenuPartNow(), part = partWas;
+        for (i = first; i < gFontCmdCount; i++, cmd++) {
+            int want = i < FONT_PART_MAX ? sFontPart[i] : partWas;
+            if (want != part && want >= 0) { /* (widescreen menus: the part the command was made in) */
+                Font_EndPacket(&pkt);
+                Port_MenuPart(want);
+                part = want;
+                Font_BeginPacket(&pkt);
+            }
+            Font_PutScissor(&pkt, cmd);
+            Font_OpenSpriteTag(&pkt, &tag);
+            Font_DrawCmd(&pkt, cmd);
+            Font_CloseSpriteTag(&pkt, &tag);
+        }
+        Font_EndPacket(&pkt);
+            if (part != partWas) {
+                Port_MenuPart(partWas);
+            }
+        }
+#else
         for (i = first; i < gFontCmdCount; i++, cmd++) {
             Font_PutScissor(&pkt, cmd);
             Font_OpenSpriteTag(&pkt, &tag);
@@ -315,6 +356,7 @@ void Font_Flush(s32 first) {
             Font_CloseSpriteTag(&pkt, &tag);
         }
         Font_EndPacket(&pkt);
+#endif
         Font_Home();
         Font_SetCmdCount(first);
     }
@@ -355,6 +397,9 @@ s32 Font_MeasureWidthEx(void *str, s32 kind, f32 scale) {
     s32 gap = gFontGlyphGap + style->spacingX;
     u16 ch;
     FontGlyph *glyph;
+#ifdef PORT
+    if (kind == FONT_CMD_STR16) str = (void *)UiText_TranslateString((const u16 *)str);
+#endif
 
 #ifdef PORT_VITA
     {
@@ -415,6 +460,9 @@ f32 Font_FitScale(u16 *str, s32 width) {
 s32 Font_CountLinesEx(void *str, s32 kind) {
     s32 lines = 1;
     u16 ch;
+#ifdef PORT
+    if (kind == FONT_CMD_STR16) str = (void *)UiText_TranslateString((const u16 *)str);
+#endif
 
 #ifdef PORT_VITA
     {
@@ -474,11 +522,17 @@ FontCmd *Font_AddCmdAt(s32 x, s32 y, s32 arg, s32 digits, s32 kind) {
 
 /* Prints a 16-bit string at the cursor. */
 void Font_Print(u16 *str) {
+#ifdef PORT
+    str = (u16 *)UiText_TranslateString(str);
+#endif
     Font_AddCmd((s32)str, 0, FONT_CMD_STR16);
 }
 
 /* Prints a 16-bit string at a position. */
 void Font_PrintAt(s32 x, s32 y, u16 *str) {
+#ifdef PORT
+    str = (u16 *)UiText_TranslateString(str);
+#endif
     Font_AddCmdAt(x, y, (s32)str, 0, FONT_CMD_STR16);
 }
 
@@ -1046,6 +1100,13 @@ FontGlyph *Font_SearchGlyph(FontSlot *slot, u16 ch) {
 
 /* Takes the next free command (no bound check against gFontCmdMax). */
 FontCmd *Font_AllocCmd(void) {
+#ifdef PORT
+    if (gFontCmdCount < FONT_PART_MAX) {
+        int part = Port_MenuPartNow();
+        sFontPart[gFontCmdCount] = (signed char)(part == 1 || part == 8 ? 0 : part); /* (text is never stretched: in a
+            part that fills the width, 1, or the item shop's page, 8, whose room fills it, it is kept in the middle, 0) */
+    }
+#endif
     return &gFontCmds[gFontCmdCount++];
 }
 
@@ -1094,6 +1155,12 @@ FontCmd *Font_NewCmd(s32 arg, s32 digits, s32 x, s32 y, s32 homeX, s32 kind) {
     cmd->tag = gFontStyle.tag;
     cmd->tagArg = gFontStyle.tagArg;
     cmd->vramBase = -1;
+#ifdef PORT
+    {
+        extern void PortA11y_FontText(s32 kind, s32 arg, s32 flags); /* PC build: the screen reader (port/src/a11y_game.c) */
+        PortA11y_FontText(kind, arg, cmd->flags);
+    }
+#endif
     return cmd;
 }
 

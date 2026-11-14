@@ -13,6 +13,7 @@
  * number or keeps a flag in its top bit would show here first. heap=cdram (bt3.txt) asks for the heap in the
  * graphics memory area instead, which lies lower; an experiment for that case, not a fix.
  */
+#include <malloc.h>
 #include <psp2/io/fcntl.h>
 #include <psp2/kernel/sysmem.h>
 #include <stdint.h>
@@ -155,6 +156,35 @@ void Vita_LoadGameData(const char *disc) {
     if (hash != gPortDatChecksum) {
         Vita_Fatal("SLUS_216.78 / BIN/DBZP.BIN in\n  %s\nare not the unmodified USA release (SLUS-21678).", disc);
     }
+}
+
+/* Blocks the game takes outside its heap (Port_GameBigAlloc; the PC port's, 0.1.39: a stage larger than the game's
+   own stage buffer, src/battle/battle_load.c, only with stages added from outside the disc, which the Vita does not
+   have). From the C library's heap, each with a header in front saying it is one, so that Heap_Free (src/sys/heap.c),
+   which asks Port_GameBigFree first about every block it frees, gives it back here; an address inside the game heap is
+   the heap's at once. The same as the BT4 fork's. */
+#define BIG_MAGIC 0xB16B7A4Cu
+unsigned Port_GameBigAlloc(int size) {
+    uint8_t *p = memalign(64, (size_t)(size > 0 ? size : 0) + 64);
+    if (p == NULL) {
+        Vita_Fatal("out of memory: %d bytes outside the game heap", size);
+    }
+    ((uint32_t *)p)[0] = BIG_MAGIC;
+    ((uint32_t *)p)[1] = (uint32_t)(uintptr_t)p ^ BIG_MAGIC;
+    return (unsigned)(uintptr_t)(p + 64);
+}
+int Port_GameBigFree(unsigned addr) {
+    uint32_t *h;
+    if (addr == 0 || (addr >= gVitaHeapBase && addr < gVitaHeapBase + HEAP_SIZE) || addr < 64) {
+        return 0;
+    }
+    h = (uint32_t *)(uintptr_t)(addr - 64);
+    if (h[0] != BIG_MAGIC || h[1] != ((uint32_t)(uintptr_t)h ^ BIG_MAGIC)) {
+        return 0;
+    }
+    h[0] = 0;
+    free(h);
+    return 1;
 }
 
 /* The program's end address on the PS2: a table of the PS2's C library points at it; nothing reads it here

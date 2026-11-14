@@ -2,6 +2,10 @@
 #include "menu/menu_h.h"
 #include "sys/pad.h"
 #include "sys/save.h"
+#ifdef PORT
+extern void Port_MenuPage(int screen); /* port/src/gs_marker.c: widescreen menus */
+extern void Port_MenuFill(int on);
+#endif
 
 CharRef *gCharRef = NULL; /* 0x3B4854 */
 
@@ -170,6 +174,10 @@ void CharRef_Init(s32 section) {
     CharRef_BuildList();
 }
 
+#ifdef PORT
+extern void Port_MenuScene3D(int on); /* port/src/headless.c */
+#endif
+
 /* Runs the screen until its fade out is over and the picture loader is idle; returns 0. */
 s32 CharRef_Run(s32 section) {
     CharRef_Init(section);
@@ -180,6 +188,11 @@ s32 CharRef_Run(s32 section) {
         Pad_Update();
         Snd_Update();
         ColorFade_Update();
+#ifdef PORT
+        /* The model viewer is a 3D scene, not a page composed for 4:3: in a picture wider than 4:3 it is shown as a
+           fight is, with the wider view, and not stretched like the menus around it. */
+        Port_MenuScene3D(gCharRef->state == CHARREF_ST_VIEW);
+#endif
         if (gCharRef->state == CHARREF_ST_VIEW) {
             ChrView_Update();
         } else {
@@ -208,6 +221,9 @@ s32 CharRef_Run(s32 section) {
         }
     }
 done:
+#ifdef PORT
+    Port_MenuScene3D(0);
+#endif
     Dma_ResetBuffers();
     CharRef_Term();
     return 0;
@@ -238,7 +254,16 @@ void CharRef_Draw(void) {
     MChrTblEntry *tbl;
 
     Job_Run();
+#ifdef PORT
+    /* widescreen menus: this screen's page, its backdrop filling the width; a character's own pages (53) as one
+       page in the middle, the picture, the panel and the window of the introduction together */
+    Port_MenuPage(state == CHARREF_ST_INTRO || state == CHARREF_ST_LIST || state == CHARREF_ST_LEAVE ? 17 : 53);
+    Port_MenuFill(1);
     Sprite_DrawPicture(gCharRef->bg, 0, 0, 0x80);
+    Port_MenuFill(0);
+#else
+    Sprite_DrawPicture(gCharRef->bg, 0, 0, 0x80);
+#endif
     Flash_Advance(&gCharRef->flash[0]);
     if (pose) {
         gCharRef->tex[32] = gCharRef->tex[43];
@@ -417,6 +442,9 @@ void CharRef_Draw(void) {
         MsgWin_Draw(0, 0, gCharRef->voiceLine + gCharRef->commentBase + gCharRef->comment);
     }
     ColorFade_Draw();
+#ifdef PORT
+    Port_MenuPage(0);
+#endif
 }
 
 /* State 0: waits for the movie's intro, then lights the cursor row and greets. */

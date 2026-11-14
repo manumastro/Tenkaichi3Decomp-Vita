@@ -16,11 +16,29 @@
 #include <vector>
 #include <SDL3/SDL.h>
 #include "imgui.h"
+#include "imgui_internal.h" // ImGui::NavInitWindow
 #include "imgui_impl_sdl3.h"
 #include "imgui_impl_sdlgpu3.h"
+#include "imgui_impl_opengl3.h"
+#include "imgui_impl_opengl3_loader.h" // glViewport, glClear for the OpenGL window (set up by ImGui_ImplOpenGL3_Init)
 #include "native.h"
+#include "ui.h" // UiA11y_*: the focused control said to the screen reader (port/src/gs/ui_a11y.cpp)
 
 #define GAME "Tenkaichi3Decomp" /* the program this sets up: GAME, GAME.dat; this program is GAME-setup */
+
+// The screen reader, as in the game: through Prism when prism.dll is beside this program (port/src/gs/a11y.c, with
+// its settings in bt3_settings.txt when there is one: a11y=0 turns it off). ui_a11y.cpp says the focused control;
+// said here are each page as it comes up (its heading and text), a disc image chosen, a problem under a field, and
+// the installation's steps as they start and end.
+extern "C" {
+int PortA11y_Begin(void);
+void PortA11y_Say(const char *text, int flags);
+void PortA11y_Event(const SDL_Event *ev);
+// a11y.c's links to the game's sound, which the setup never uses (it plays no cue and no voice)
+SDL_AudioDeviceID Port_AudioDevice(void) { return 0; }
+int PortA11y_VoicePercent(const void *player) { (void)player; return -1; }
+}
+#define A11Y_INTERRUPT 1 // (gs/a11y.c)
 
 enum Page { PAGE_PICK, PAGE_RUN, PAGE_DONE, PAGE_FAILED };
 enum State { PENDING, RUNNING, OK, SKIPPED, FAILED };
@@ -32,6 +50,7 @@ struct Missing { std::string name, why, pkg; };
 static const char *kSourceSteps[] = {"Requirements", "Disc image", "Game data", "Executable data", "Build", "Self-test"};
 static const char *kReleaseSteps[] = {"Disc image", "Game data", "Self-test"};
 static const struct { const char *title, *help; } kHelp[] = {
+    {"European languages", "Spanish, German, French and Italian, plus the opening soundtrack"},
     {"Requirements", "Compilers and tools on this computer"}, {"Disc image", "Your disc image is read and checked"},
     {"Game data", "Models, sounds and text are unpacked"}, {"Executable data", "The data tables of the game's programs"},
     {"Build", "The port is compiled (a few minutes)"}, {"Self-test", "The game's demo fight, without a window"}};
@@ -48,8 +67,19 @@ static const char *step_help(const std::string &title) {
 
 static SDL_Window *sWindow;
 static SDL_GPUDevice *sDevice;
+// The window is drawn through SDL's GPU layer (Vulkan on Linux, Direct3D 12 on Windows) or, where that cannot
+// start (no Vulkan driver, a graphics chip too old for it: reported for Intel Ivy Bridge), through OpenGL.
+// BT3_GPU_API=gl asks for OpenGL at once, as it does for the game.
+static SDL_GLContext sGl;
+static bool sUseGl;
 static Page sPage = PAGE_PICK;
 static char sIso[1024];
+// Optional: a disc image of the European release (SLES-54945), for Spanish, German, French and Italian. The game is
+// always set up from the USA one; from this one only the languages' archive entries are taken (native.cpp step_eu,
+// install.py --eu-iso).
+static char sIsoEu[1024];
+static bool sEuOnly;    // only the languages are added (the game was set up before: the "Ready to play" page)
+static int sDialogFor;  // which field the file dialog fills: 0 the USA image, 1 the European one
 static std::string sRoot, sError, sLauncher, sLine;
 static std::vector<StepRow> sRows;
 static std::vector<Missing> sMissing;
@@ -61,6 +91,29 @@ static bool sDialogReady, sQuit;
 static Uint64 sRunStart, sRunEnd;
 static const ImVec4 kAccent(0.96f, 0.55f, 0.13f, 1.0f), kGreen(0.36f, 0.80f, 0.45f, 1.0f), kRed(0.93f, 0.36f, 0.33f, 1.0f),
     kDim(0.60f, 0.63f, 0.70f, 1.0f);
+// For the screen reader (see the top): the page's words as this frame drew them, the problem shown under a field, and
+// what happened since the last frame (steps, a file chosen), said after the page so that the page does not cut it.
+static std::string sPageWords, sProblem, sSaidProblem, sNews;
+static int sSaidPage = -1, sNotePercent;
+
+static void page_words(const std::string &text) {
+    if (!text.empty()) {
+        sPageWords += (sPageWords.empty() ? "" : " ") + text;
+    }
+}
+
+static void news(const std::string &text) {
+    if (!text.empty()) {
+        sNews += (sNews.empty() ? "" : ". ") + text;
+    }
+}
+
+// A file name without its folder (what is said of a disc image chosen).
+static std::string file_name(const char *path) {
+    const char *slash = strrchr(path, '/'), *back = strrchr(path, '\\');
+    const char *p = slash > back ? slash : back;
+    return p != NULL ? p + 1 : path;
+}
 
 static bool file_exists(const char *path) {
     SDL_PathInfo info;
@@ -107,17 +160,29 @@ static void style() {
 
 // ---------------------------------------------------------------------------------------------- the engine script
 
+// The rows as the run numbers its steps: the European languages, when asked for, before the self-test (native.cpp
+// work, install.py main); only them when they are added to a game set up before.
 static void reset_rows() {
-    size_t n = sRelease ? sizeof(kReleaseSteps) / sizeof(kReleaseSteps[0]) : sizeof(kSourceSteps) / sizeof(kSourceSteps[0]);
-    sRows.assign(n, StepRow());
-    for (size_t i = 0; i < n; i++) {
-        sRows[i].title = sRelease ? kReleaseSteps[i] : kSourceSteps[i];
+    std::vector<std::string> titles;
+    if (sRelease) {
+        titles.assign(kReleaseSteps, kReleaseSteps + sizeof(kReleaseSteps) / sizeof(kReleaseSteps[0]));
+    } else {
+        titles.assign(kSourceSteps, kSourceSteps + sizeof(kSourceSteps) / sizeof(kSourceSteps[0]));
+    }
+    if (sEuOnly) {
+        titles.assign(1, "European languages");
+    } else if (sIsoEu[0] != '\0') {
+        titles.insert(titles.end() - 1, "European languages");
+    }
+    sRows.assign(titles.size(), StepRow());
+    for (size_t i = 0; i < titles.size(); i++) {
+        sRows[i].title = titles[i];
     }
 }
 
 static void start_install() {
-    static std::string iso;
-    const char *args[8];
+    static std::string iso, euIso;
+    const char *args[10];
     SDL_PropertiesID props = SDL_CreateProperties();
     std::string script = sRoot + "install.py";
     int n = 0;
@@ -130,7 +195,7 @@ static void start_install() {
         sLauncher.clear();
         sRunStart = SDL_GetTicks();
         sNative = true;
-        Native_Start(sRoot, sIso);
+        Native_Start(sRoot, sEuOnly ? "" : sIso, sIsoEu);
         sPage = PAGE_RUN;
         return;
     }
@@ -140,6 +205,11 @@ static void start_install() {
     args[n++] = "--machine";
     args[n++] = "--iso";
     args[n++] = iso.c_str();
+    if (sIsoEu[0] != '\0') {
+        euIso = sIsoEu;
+        args[n++] = "--eu-iso";
+        args[n++] = euIso.c_str();
+    }
     if (getenv("BT3_SETUP_ARGS") != NULL) { // one extra argument for testing, such as --skip-test
         args[n++] = getenv("BT3_SETUP_ARGS");
     }
@@ -205,13 +275,26 @@ static void event(const std::string &line) {
             sRows[i - 1].state = RUNNING;
             sRows[i - 1].start = SDL_GetTicks();
             sRows[i - 1].detail.clear();
+            news(sRows[i - 1].title + ", step " + std::to_string(i) + " of " + std::to_string(sRows.size()));
+            sNotePercent = 0;
         }
     } else if (cur != NULL && kind == "note") {
         cur->detail = text;
+        // a progress note ("37%, 1200 files") comes for every percent: said every 10
+        int percent = text.find('%') != std::string::npos ? atoi(text.c_str()) : -1;
+        if (percent < 0) {
+            news(text);
+        } else if (percent / 10 > sNotePercent / 10) {
+            news(text);
+            sNotePercent = percent;
+        }
     } else if (cur != NULL && (kind == "ok" || kind == "skip" || kind == "fail")) {
         cur->state = kind == "ok" ? OK : kind == "skip" ? SKIPPED : FAILED;
         cur->end = SDL_GetTicks();
         cur->detail = kind == "fail" ? "" : text;
+        if (kind != "fail") { // (a failure is said by the page that comes up)
+            news(cur->title + (kind == "ok" ? " done" : " skipped") + (text.empty() ? "" : ": " + text));
+        }
     } else if (kind == "missing") {
         Missing m;
         size_t a = text.find('|'), b = text.find('|', a == std::string::npos ? 0 : a + 1);
@@ -302,15 +385,18 @@ static void pump_install() {
 // --------------------------------------------------------------------------------------------------------- pages
 
 static void SDLCALL dialog_done(void *userdata, const char *const *files, int filter) {
-    (void)userdata; (void)filter;
+    (void)filter;
     std::lock_guard<std::mutex> lock(sDialogLock);
     if (files != NULL && files[0] != NULL) {
         sDialogResult = files[0];
+        sDialogFor = userdata != NULL; // (NULL: the USA image's field)
         sDialogReady = true;
     }
 }
 
 static void heading(const char *title, const char *sub) {
+    page_words(std::string(title) + ".");
+    page_words(sub);
     ImGui::PushFont(NULL, 30.0f);
     ImGui::TextUnformatted(title);
     ImGui::PopFont();
@@ -343,35 +429,68 @@ static void bottom_row(int buttons) {
     ImGui::SetCursorPos(ImVec2(ImGui::GetCursorPosX() + avail.x - w, ImGui::GetCursorPosY() + avail.y - 40.0f));
 }
 
+// The European disc image's field (optional). Returns false when something is in it that is not a file.
+static bool eu_field() {
+    static const SDL_DialogFileFilter filters[] = {{"PS2 disc image", "iso;bin;img"}, {"All files", "*"}};
+    ImGui::Dummy(ImVec2(0.0f, 6.0f));
+    ImGui::TextUnformatted("European disc image (optional)");
+    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 130.0f);
+    ImGui::InputTextWithHint("##isoeu", "the European release (SLES-54945)", sIsoEu, sizeof(sIsoEu));
+    UiA11y_Field("European disc image (optional)", sIsoEu);
+    ImGui::SameLine();
+    if (ImGui::Button("Browse...##eu", ImVec2(120.0f, 0.0f))) {
+        SDL_ShowOpenFileDialog(dialog_done, (void *)1, sWindow, filters, 2, NULL, false);
+    }
+    if (sIsoEu[0] != '\0' && !file_exists(sIsoEu)) {
+        ImGui::TextColored(kRed, "That file does not exist.");
+        sProblem += "European disc image: that file does not exist. ";
+        return false;
+    }
+    ImGui::PushStyleColor(ImGuiCol_Text, kDim);
+    ImGui::TextWrapped("Adds Spanish, German, French and Italian: menus, battle screen and text, as the European release has them. F1 > UI > Language picks one.");
+    ImGui::PopStyleColor();
+    return true;
+}
+
 static void page_pick() {
     static const SDL_DialogFileFilter filters[] = {{"PS2 disc image", "iso;bin;img"}, {"All files", "*"}};
     bool ok = file_exists(sIso);
 
     heading(GAME, "This sets the game up on your computer from your own PlayStation 2 disc.");
-    ImGui::TextWrapped("Choose your disc image of Dragon Ball Z: Budokai Tenkaichi 3, USA release (SLUS-21678), as an .iso file. "
-                       "The game's data is taken from it and stays on this computer. %s",
-                       sRelease ? "Nothing is downloaded." : "Nothing is downloaded except one small tool.");
+    std::string intro = std::string("Choose your disc image of Dragon Ball Z: Budokai Tenkaichi 3, USA release (SLUS-21678), as an .iso file. "
+                                    "The game's data is taken from it and stays on this computer. ") +
+                        (sRelease ? "Nothing is downloaded." : "Nothing is downloaded except one small tool.");
+    ImGui::TextWrapped("%s", intro.c_str());
+    page_words(intro);
     ImGui::Dummy(ImVec2(0.0f, 10.0f));
     ImGui::TextUnformatted("Disc image");
     ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 130.0f);
     ImGui::InputTextWithHint("##iso", "drop the file on this window, or browse", sIso, sizeof(sIso));
+    UiA11y_Field("Disc image", sIso);
     ImGui::SameLine();
     if (ImGui::Button("Browse...", ImVec2(120.0f, 0.0f))) {
         SDL_ShowOpenFileDialog(dialog_done, NULL, sWindow, filters, 2, NULL, false);
     }
     if (sIso[0] != '\0' && !ok) {
         ImGui::TextColored(kRed, "That file does not exist.");
+        sProblem += "Disc image: that file does not exist. ";
     } else if (sRoot.empty()) {
-        ImGui::TextColored(kRed, "Neither the game (" GAME ", " GAME ".dat) nor install.py was found next to this program.");
+        static const char *none = "Neither the game (" GAME ", " GAME ".dat) nor install.py was found next to this program.";
+        ImGui::TextColored(kRed, "%s", none);
+        sProblem += none;
     } else {
-        ImGui::TextColored(kDim, sRelease ? "Needs about 4 GB of free space and takes a minute or two." : "Needs about 4 GB of free space and takes 5 to 10 minutes.");
+        const char *need = sRelease ? "Needs about 4 GB of free space and takes a minute or two." : "Needs about 4 GB of free space and takes 5 to 10 minutes.";
+        ImGui::TextColored(kDim, "%s", need);
+        page_words(need);
     }
+    bool euOk = eu_field();
     bottom_row(2);
     if (big_button("Close", false)) {
         sQuit = true;
     }
     ImGui::SameLine();
-    if (big_button("Install", true, ok && !sRoot.empty())) {
+    if (big_button("Install", true, ok && euOk && !sRoot.empty())) {
+        sEuOnly = false;
         start_install();
     }
 }
@@ -458,6 +577,15 @@ static void page_done() {
     step_list();
     ImGui::Dummy(ImVec2(0.0f, 4.0f));
     ImGui::TextColored(kDim, "In the game, F1 opens the settings: resolution, widescreen, controls and sound.");
+    page_words("In the game, F1 opens the settings: resolution, widescreen, controls and sound.");
+    if (sRelease && !Native_EuInstalled(sRoot)) { // the languages can be added at any time
+        static const SDL_DialogFileFilter filters[] = {{"PS2 disc image", "iso;bin;img"}, {"All files", "*"}};
+        ImGui::Dummy(ImVec2(0.0f, 4.0f));
+        ImGui::TextWrapped("Spanish, German, French and Italian, plus the opening soundtrack: add a European disc image (SLES-54945).");
+        if (ImGui::Button("Add languages and music...")) {
+            SDL_ShowOpenFileDialog(dialog_done, (void *)1, sWindow, filters, 2, NULL, false);
+        }
+    }
     bottom_row(2);
     if (big_button("Close", false)) {
         sQuit = true;
@@ -480,6 +608,12 @@ static void page_done() {
         if (game != NULL) {
             SDL_DestroyProcess(game);
             sQuit = true;
+        } else {
+            sError = std::string("The game could not be started: ") + SDL_GetError();
+#ifdef __APPLE__
+            sError += "\nmacOS may still be blocking it: see step 0 of README.txt (xattr -dr com.apple.quarantine on this folder).";
+#endif
+            sPage = PAGE_FAILED;
         }
     }
 }
@@ -489,6 +623,10 @@ static void page_failed() {
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.93f, 0.36f, 0.33f, 0.10f));
     ImGui::BeginChild("why", ImVec2(0.0f, sMissing.empty() ? 150.0f : 90.0f), ImGuiChildFlags_AlwaysUseWindowPadding);
     ImGui::TextWrapped("%s", sError.c_str());
+    page_words(sError);
+    for (auto &m : sMissing) {
+        page_words("Missing: " + m.name + ", used for " + m.why + ", package to install: " + m.pkg + ".");
+    }
     ImGui::EndChild();
     ImGui::PopStyleColor();
     if (!sMissing.empty() && ImGui::BeginTable("missing", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV)) {
@@ -520,9 +658,19 @@ static void page_failed() {
 
 static void build_ui() {
     ImGuiIO &io = ImGui::GetIO();
+    int drawn = sPage; // (a button can change the page while it is drawn: its words are this one's)
+    sPageWords.clear();
+    sProblem.clear();
+    UiA11y_Frame(1, 0);
     ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f));
     ImGui::SetNextWindowSize(io.DisplaySize);
-    ImGui::Begin("setup", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
+    // (no name before "###": the screen reader says the page's heading, not the window's name)
+    ImGui::Begin("###setup", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
+    static int navPage = -1;
+    if (sPage != navPage) { // the keyboard's focus to the new page's first control (it was on one of the page before: Tab
+        navPage = sPage;    // and the arrows then went nowhere)
+        ImGui::NavInitWindow(ImGui::GetCurrentWindow(), true);
+    }
     switch (sPage) {
     case PAGE_PICK: page_pick(); break;
     case PAGE_RUN: page_run(); break;
@@ -530,6 +678,26 @@ static void build_ui() {
     case PAGE_FAILED: page_failed(); break;
     }
     ImGui::End();
+    UiA11y_End();
+    // a page that came up: all its words, interrupting; then what happened (queued), then a new problem under a field
+    // once the field is left (not while a path is typed into it)
+    if (drawn != sSaidPage && drawn == sPage) {
+        sSaidPage = drawn;
+        sSaidProblem.clear();
+        PortA11y_Say(sPageWords.c_str(), A11Y_INTERRUPT);
+        UiA11y_QueueNext(); // (the control the focus comes to is said after the page, not over it)
+        if (drawn != PAGE_RUN) {
+            sNews.clear(); // (the last step's end: "Ready to play" or "Setup stopped" says how it went)
+        }
+    }
+    if (!sNews.empty()) {
+        PortA11y_Say(sNews.c_str(), 0);
+        sNews.clear();
+    }
+    if (sProblem != sSaidProblem && !ImGui::IsAnyItemActive()) {
+        sSaidProblem = sProblem;
+        PortA11y_Say(sProblem.c_str(), 0);
+    }
 }
 
 // ---------------------------------------------------------------------------------------------------- the window
@@ -596,17 +764,75 @@ static void shot(ImDrawData *dd, Uint32 w, Uint32 h, int number) {
     SDL_ReleaseGPUTexture(sDevice, tex);
 }
 
+#ifdef _WIN32
+// The few functions of Windows used below, declared here: its headers define names this file has (FAILED, ...).
+extern "C" {
+__declspec(dllimport) wchar_t *__stdcall GetCommandLineW(void);
+__declspec(dllimport) wchar_t **__stdcall CommandLineToArgvW(const wchar_t *line, int *count);
+__declspec(dllimport) int __stdcall WideCharToMultiByte(unsigned page, unsigned long flags, const wchar_t *wide, int wideLen, char *out, int outLen,
+                                                        const char *def, int *usedDef);
+__declspec(dllimport) void *__stdcall LocalFree(void *mem);
+}
+
+// The program's arguments in UTF-8. Those main() gets on Windows are in the system's code page: a disc image whose
+// path has letters outside it arrives with '?' in their place, and one with letters inside it as bytes that are not
+// UTF-8, which is what SDL opens files by. Either way the image was "not found". NULL when Windows gives none.
+static char **utf8_args(int *count) {
+    int n = 0;
+    wchar_t **wide = CommandLineToArgvW(GetCommandLineW(), &n);
+    char **out = wide != NULL ? (char **)SDL_calloc((size_t)n + 1, sizeof(char *)) : NULL;
+
+    for (int i = 0; out != NULL && i < n; i++) {
+        int len = WideCharToMultiByte(65001 /* CP_UTF8 */, 0, wide[i], -1, NULL, 0, NULL, NULL);
+        out[i] = (char *)SDL_calloc((size_t)(len > 0 ? len : 1), 1);
+        if (out[i] == NULL) {
+            out = NULL; // (out of memory at start-up: main's own arguments are used)
+            break;
+        }
+        if (len > 0) {
+            WideCharToMultiByte(65001, 0, wide[i], -1, out[i], len, NULL, NULL);
+        }
+    }
+    if (wide != NULL) {
+        LocalFree(wide);
+    }
+    *count = n;
+    return out;
+}
+#endif
+
 int main(int argc, char **argv) {
     static const char *fonts[] = {
         "/usr/share/fonts/TTF/DejaVuSans.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/noto/NotoSans-Regular.ttf", "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
         "/usr/share/fonts/liberation/LiberationSans-Regular.ttf", "C:\\Windows\\Fonts\\segoeui.ttf",
+        "/System/Library/Fonts/Supplemental/Arial.ttf", "/System/Library/Fonts/Geneva.ttf", // (macOS)
     };
     ImGui_ImplSDLGPU3_InitInfo info;
     int shots = 0, shotKey = -1;
 
+#ifdef _WIN32
+    {
+        int count = 0;
+        char **args = utf8_args(&count); // (kept for the whole run)
+        if (args != NULL) {
+            argc = count;
+            argv = args;
+        }
+    }
+#endif
+#ifdef __APPLE__
+    {
+        // Started from Finder, a program gets only /usr/bin:/bin:/usr/sbin:/sbin: install.py would not find Homebrew's
+        // tools (glslc, spirv-cross, 7z) and call them missing. Homebrew's folders first, as in a Terminal.
+        const char *path = getenv("PATH");
+        std::string more = std::string("/opt/homebrew/bin:/usr/local/bin:") + (path != NULL && path[0] != '\0' ? path : "/usr/bin:/bin:/usr/sbin:/sbin");
+        setenv("PATH", more.c_str(), 1);
+    }
+#endif
     if (argc > 2 && strcmp(argv[1], "--install") == 0) {
-        // Without a window: Tenkaichi3Decomp-setup --install <disc.iso>. A release folder only; prints the event lines.
+        // Without a window: Tenkaichi3Decomp-setup --install <disc.iso> [<European disc.iso>] (an empty first one: only
+        // the languages, for a folder set up before). A release folder only; prints the event lines.
         std::string line;
         bool ok = false;
         SDL_Init(0);
@@ -615,7 +841,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, GAME "-setup --install works in a release folder (" GAME " and " GAME ".dat next to it).\nIn a source checkout: python3 install.py --iso <file>\n");
             return 2;
         }
-        Native_Start(sRoot, argv[2]);
+        Native_Start(sRoot, argv[2], argc > 3 ? argv[3] : "");
         for (bool last = false; !last;) {
             last = !Native_Running(); // one more round after the worker has ended: nothing is left behind
             while (Native_Poll(line)) {
@@ -632,17 +858,72 @@ int main(int argc, char **argv) {
         fprintf(stderr, GAME "-setup: %s\n", SDL_GetError());
         return 1;
     }
-    sWindow = SDL_CreateWindow(GAME " - Setup", 760, 560, SDL_WINDOW_HIGH_PIXEL_DENSITY);
-    sDevice = SDL_CreateGPUDevice(SDL_GPU_SHADERFORMAT_SPIRV | SDL_GPU_SHADERFORMAT_DXIL | SDL_GPU_SHADERFORMAT_MSL, false, NULL);
-    if (sWindow == NULL || sDevice == NULL || !SDL_ClaimWindowForGPUDevice(sDevice, sWindow)) {
-        fprintf(stderr, GAME "-setup: no window: %s\nThe same setup runs in a terminal: python3 install.py\n", SDL_GetError());
-        return 1;
+    const char *glsl = "#version 330";
+    {
+        const char *api = getenv("BT3_GPU_API");
+        bool wantGl = api != NULL && (strcmp(api, "gl") == 0 || strcmp(api, "opengl") == 0);
+        std::string why;
+        if (!wantGl) {
+            sWindow = SDL_CreateWindow(GAME " - Setup", 760, 560, SDL_WINDOW_HIGH_PIXEL_DENSITY);
+            sDevice = SDL_CreateGPUDevice(SDL_GPU_SHADERFORMAT_SPIRV | SDL_GPU_SHADERFORMAT_DXIL | SDL_GPU_SHADERFORMAT_MSL, false, NULL);
+            if (sWindow == NULL || sDevice == NULL || !SDL_ClaimWindowForGPUDevice(sDevice, sWindow)) {
+                why = SDL_GetError();
+                if (sDevice != NULL) {
+                    SDL_DestroyGPUDevice(sDevice);
+                    sDevice = NULL;
+                }
+                if (sWindow != NULL) {
+                    SDL_DestroyWindow(sWindow);
+                    sWindow = NULL;
+                }
+            }
+        }
+        if (sDevice == NULL) {
+            // OpenGL 3.3 core, and failing that whatever 3.0 context the driver gives
+            for (int attempt = 0; attempt < 2 && sGl == NULL; attempt++) {
+                SDL_GL_ResetAttributes();
+                SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+#ifdef __APPLE__
+                // (macOS gives only a 3.2 or later core context, and only forward-compatible: GLSL 150)
+                SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 2);
+                SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+                SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, SDL_GL_CONTEXT_FORWARD_COMPATIBLE_FLAG);
+                glsl = "#version 150";
+#else
+                SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, attempt == 0 ? 3 : 0);
+                SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, attempt == 0 ? SDL_GL_CONTEXT_PROFILE_CORE : 0);
+                glsl = attempt == 0 ? "#version 330" : "#version 130";
+#endif
+                SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+                sWindow = SDL_CreateWindow(GAME " - Setup", 760, 560, SDL_WINDOW_HIGH_PIXEL_DENSITY | SDL_WINDOW_OPENGL);
+                sGl = sWindow != NULL ? SDL_GL_CreateContext(sWindow) : NULL;
+                if (sGl == NULL && sWindow != NULL) {
+                    SDL_DestroyWindow(sWindow);
+                    sWindow = NULL;
+                }
+            }
+            if (sGl == NULL) {
+                fprintf(stderr, GAME "-setup: no window: %s%s%s\nThe same setup runs without a window: " GAME "-setup --install <disc image>\n",
+                        why.c_str(), why.empty() ? "" : "; OpenGL: ", SDL_GetError());
+                return 1;
+            }
+            if (!wantGl) {
+                fprintf(stderr, GAME "-setup: %s; the window uses OpenGL\n", why.c_str());
+            }
+            SDL_GL_MakeCurrent(sWindow, sGl);
+            SDL_GL_SetSwapInterval(1);
+            sUseGl = true;
+        } else {
+            SDL_SetGPUSwapchainParameters(sDevice, sWindow, SDL_GPU_SWAPCHAINCOMPOSITION_SDR, SDL_GPU_PRESENTMODE_VSYNC);
+        }
     }
-    SDL_SetGPUSwapchainParameters(sDevice, sWindow, SDL_GPU_SWAPCHAINCOMPOSITION_SDR, SDL_GPU_PRESENTMODE_VSYNC);
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO &io = ImGui::GetIO();
     io.IniFilename = NULL;
+    // The keyboard reaches every control: Tab and the arrows move, Space or Enter presses. Without this, Tab stops at
+    // the text field only and no button can be pressed without a mouse.
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     style();
     for (size_t i = 0; i < sizeof(fonts) / sizeof(fonts[0]); i++) {
         if (file_exists(fonts[i])) {
@@ -650,12 +931,30 @@ int main(int argc, char **argv) {
             break;
         }
     }
-    ImGui_ImplSDL3_InitForSDLGPU(sWindow);
-    info.Device = sDevice;
-    info.ColorTargetFormat = SDL_GetGPUSwapchainTextureFormat(sDevice, sWindow);
-    info.MSAASamples = SDL_GPU_SAMPLECOUNT_1;
-    ImGui_ImplSDLGPU3_Init(&info);
+    if (sUseGl) {
+        ImGui_ImplSDL3_InitForOpenGL(sWindow, sGl);
+        ImGui_ImplOpenGL3_Init(glsl);
+    } else {
+        ImGui_ImplSDL3_InitForSDLGPU(sWindow);
+        info.Device = sDevice;
+        info.ColorTargetFormat = SDL_GetGPUSwapchainTextureFormat(sDevice, sWindow);
+        info.MSAASamples = SDL_GPU_SAMPLECOUNT_1;
+        ImGui_ImplSDLGPU3_Init(&info);
+    }
     sRoot = find_root();
+#ifdef __APPLE__
+    if (sRelease) {
+        // A folder downloaded from the internet is marked "quarantined" by macOS, and a quarantined program started by
+        // another one is refused (posix_spawn: Bad file descriptor), the game included. This setup has been let through
+        // already (it runs): the mark is taken off the whole folder, as README.txt's step 0 does by hand.
+        const char *args[] = {"/usr/bin/xattr", "-dr", "com.apple.quarantine", sRoot.c_str(), NULL};
+        SDL_Process *x = SDL_CreateProcess(args, false);
+        if (x != NULL) {
+            SDL_WaitProcess(x, true, NULL);
+            SDL_DestroyProcess(x);
+        }
+    }
+#endif
     if (sRelease && Native_Installed(sRoot) && getenv("BT3_SETUP_ISO") == NULL) { // nothing left to do: offer Play
         reset_rows();
         for (auto &r : sRows) {
@@ -668,6 +967,9 @@ int main(int argc, char **argv) {
     if (argc > 1) {
         SDL_strlcpy(sIso, argv[1], sizeof(sIso));
     }
+    if (getenv("BT3_SETUP_EU_ISO") != NULL) { // (testing, with BT3_SETUP_ISO: the European image too)
+        SDL_strlcpy(sIsoEu, getenv("BT3_SETUP_EU_ISO"), sizeof(sIsoEu));
+    }
     if (getenv("BT3_SETUP_ISO") != NULL) {
         SDL_strlcpy(sIso, getenv("BT3_SETUP_ISO"), sizeof(sIso));
         if (!sRoot.empty() && file_exists(sIso)) {
@@ -676,28 +978,76 @@ int main(int argc, char **argv) {
     }
     while (!sQuit) {
         SDL_Event ev;
+        PortA11y_Begin(); // (the first call starts the speaker, when prism.dll is there)
         while (SDL_PollEvent(&ev)) {
             ImGui_ImplSDL3_ProcessEvent(&ev);
+            PortA11y_Event(&ev); // (F2 says the last words again)
             if (ev.type == SDL_EVENT_QUIT || ev.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) {
                 sQuit = true;
             } else if (ev.type == SDL_EVENT_DROP_FILE && sPage == PAGE_PICK && ev.drop.data != NULL) {
-                SDL_strlcpy(sIso, ev.drop.data, sizeof(sIso));
+                // (into the USA image's field, unless that one is filled already: then into the European one's)
+                if (file_exists(sIso) && strcmp(sIso, ev.drop.data) != 0) {
+                    SDL_strlcpy(sIsoEu, ev.drop.data, sizeof(sIsoEu));
+                    news("European disc image: " + file_name(ev.drop.data));
+                } else {
+                    SDL_strlcpy(sIso, ev.drop.data, sizeof(sIso));
+                    news("Disc image: " + file_name(ev.drop.data));
+                }
             }
         }
         {
             std::lock_guard<std::mutex> lock(sDialogLock);
             if (sDialogReady) {
-                SDL_strlcpy(sIso, sDialogResult.c_str(), sizeof(sIso));
+                SDL_strlcpy(sDialogFor ? sIsoEu : sIso, sDialogResult.c_str(), sDialogFor ? sizeof(sIsoEu) : sizeof(sIso));
                 sDialogReady = false;
+                news((sDialogFor ? "European disc image: " : "Disc image: ") + file_name(sDialogResult.c_str()));
+                if (sDialogFor && sPage == PAGE_DONE && sRelease && !Native_Running()) { // "Add languages...": only that step
+                    sEuOnly = true;
+                    start_install();
+                }
             }
         }
         pump_install();
-        ImGui_ImplSDLGPU3_NewFrame();
+        if (sUseGl) {
+            ImGui_ImplOpenGL3_NewFrame();
+        } else {
+            ImGui_ImplSDLGPU3_NewFrame();
+        }
         ImGui_ImplSDL3_NewFrame();
         ImGui::NewFrame();
         build_ui();
         ImGui::Render();
         ImDrawData *dd = ImGui::GetDrawData();
+        if (sUseGl) {
+            int pw = 0, ph = 0;
+            SDL_GetWindowSizeInPixels(sWindow, &pw, &ph);
+            glViewport(0, 0, pw, ph);
+            glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+            glClear(GL_COLOR_BUFFER_BIT);
+            ImGui_ImplOpenGL3_RenderDrawData(dd);
+            if (getenv("BT3_SETUP_SHOT") != NULL && ImGui::GetFrameCount() == 20 && pw > 0 && ph > 0) {
+                // testing: the picture of the OpenGL window, <BT3_SETUP_SHOT>_gl.ppm (rows come bottom first)
+                std::vector<unsigned char> px((size_t)pw * ph * 4);
+                char name[512];
+                glReadPixels(0, 0, pw, ph, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+                snprintf(name, sizeof(name), "%s_gl.ppm", getenv("BT3_SETUP_SHOT"));
+                FILE *fp = fopen(name, "wb");
+                if (fp != NULL) {
+                    fprintf(fp, "P6\n%d %d\n255\n", pw, ph);
+                    for (int y = ph - 1; y >= 0; y--) {
+                        for (int x = 0; x < pw; x++) {
+                            fwrite(&px[((size_t)y * pw + x) * 4], 1, 3, fp);
+                        }
+                    }
+                    fclose(fp);
+                }
+            }
+            SDL_GL_SwapWindow(sWindow);
+            if (getenv("BT3_SETUP_QUIT") != NULL && ImGui::GetFrameCount() > 30) {
+                sQuit = true; // testing: a few frames of the OpenGL window, then leave
+            }
+            continue;
+        }
         SDL_GPUCommandBuffer *cmd = SDL_AcquireGPUCommandBuffer(sDevice);
         SDL_GPUTexture *swap = NULL;
         Uint32 w = 0, h = 0;
@@ -734,6 +1084,15 @@ int main(int argc, char **argv) {
         SDL_DestroyProcess(sProc);
     }
     Native_Join();
+    if (sUseGl) {
+        ImGui_ImplOpenGL3_Shutdown();
+        ImGui_ImplSDL3_Shutdown();
+        ImGui::DestroyContext();
+        SDL_GL_DestroyContext(sGl);
+        SDL_DestroyWindow(sWindow);
+        SDL_Quit();
+        return 0;
+    }
     SDL_WaitForGPUIdle(sDevice);
     ImGui_ImplSDL3_Shutdown();
     ImGui_ImplSDLGPU3_Shutdown();

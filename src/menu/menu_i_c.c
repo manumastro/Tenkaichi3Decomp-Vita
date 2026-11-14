@@ -1,6 +1,9 @@
 #include "common.h"
 #include "menu/menu_i.h"
 #include "sys/pad.h"
+#ifdef PORT
+#include "menu/port_screen.h"
+#endif
 
 Logo *gLogo = NULL; /* 0x3B590C */
 
@@ -159,10 +162,28 @@ void FirstRun_WaitPartition(s32 pt) {
     Dma_ResetBuffers();
 }
 
+#ifdef PORT
+/* Two settings of the PC version (F1, UI): the logos and the opening movie can be left out at the start. Both
+   can be skipped with a button anyway, and nothing is loaded by either: the loading runs beside the logos and is
+   waited for after them. */
+/* Not in an online session (port/src/gs/net.c): there the sequence is part of what both copies compute from the
+   same first moment (it runs unseen and not held to real time, Port_NetWarp), and one player's setting must not
+   make their copy's start-up shorter than the other's. With "Skip logos" on one side only that copy was in the
+   character select 537 vertical blanks before the other and the two never agreed again (2026-10-13). */
+extern int Port_Setting(const char *name, int def);
+extern int Port_NetFixedStart(void);
+#define FIRSTRUN_SHOW(name) (Port_NetFixedStart() || !Port_Setting(name, 0))
+#else
+#define FIRSTRUN_SHOW(name) 1
+#endif
+
 /* The first-run sequence. Returns 1. */
 s32 FirstRun_Main(void) {
     u32 *res;
 
+#ifdef PORT
+    PortLanguage_Run(); /* first choose a language in the game window, before loading the game partition */
+#endif
     File_LoadPartitionNw(2);
     FirstRun_WaitPad(0, 0);
     PadWatch_SetEnabled(0);
@@ -171,16 +192,13 @@ s32 FirstRun_Main(void) {
     }
     BootCard_Run(2);
     res = Sprite_Unpack(MPACK_AT(gMenuArc0, 3), NULL, NULL);
+    if (FIRSTRUN_SHOW("skip_logos")) {
 #ifdef PORT_VITA
-    { /* (a test run that starts on a given screen skips the logos too) */
-        extern int gVitaStartMode;
-        if (gVitaStartMode <= 0) {
-            Logo_ShowAll(res);
-        }
-    }
-#else
-    Logo_ShowAll(res);
+        extern int gVitaStartMode; /* (a test run that starts on a given screen skips the logos too) */
+        if (gVitaStartMode <= 0)
 #endif
+        Logo_ShowAll(res);
+    }
     if (res != NULL) {
         Heap_Free(res);
     }
@@ -189,16 +207,13 @@ s32 FirstRun_Main(void) {
         gMenuArc0 = NULL;
     }
     FirstRun_WaitPartition(2);
+    if (FIRSTRUN_SHOW("skip_intro")) {
 #ifdef PORT_VITA
-    { /* a test run that starts on a given screen (bt3.txt startmode=) skips the opening movie */
-        extern int gVitaStartMode;
-        if (gVitaStartMode <= 0) {
-            Movie_PlayOpening();
-        }
-    }
-#else
-    Movie_PlayOpening();
+        extern int gVitaStartMode; /* a test run that starts on a given screen (bt3.txt startmode=) skips the opening movie */
+        if (gVitaStartMode <= 0)
 #endif
+        Movie_PlayOpening();
+    }
     PadWatch_SetEnabled(1);
     return 1;
 }

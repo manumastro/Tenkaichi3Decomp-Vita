@@ -2,6 +2,10 @@
 #include "sys/heap.h"
 #include "sys/pad.h"
 #include "sys/dialog.h"
+#ifdef PORT
+extern int gPortMenuMode;                 /* headless.c: the menus are running */
+extern void Port_MenuPage(int screen); /* port/src/gs_marker.c: widescreen menus */
+#endif
 
 typedef struct DialogProgress {
     /* 0x00 */ u8 unk0[0x14];
@@ -50,6 +54,12 @@ extern void Font_SetShadowMode(s32 mode);
 extern void Font_SetShadowColor(u32 color);
 extern void Font_SetShadowOffset(s32 x, s32 y);
 extern void Font_SetColorRGBA(s32 r, s32 g, s32 b, s32 a);
+#ifdef PORT
+extern const u16 *UiText_TranslateLine(const u32 *table, int line, const u16 *original);
+#define DIALOG_TRANSLATE(tbl, i, str) ((u16 *)UiText_TranslateLine((const u32 *)(tbl), (i), (str)))
+#else
+#define DIALOG_TRANSLATE(tbl, i, str) (str)
+#endif
 
 #define DIALOG_TEXT(tbl, i) ((u16 *)((u8 *)(tbl) + ((tbl)[(i) + 1] / 4 * 4)))
 #define DIALOG_PART(file, i) ((DialogResHdr *)((u8 *)(file) + ((file)[i] / 4 * 4)))
@@ -84,7 +94,7 @@ void Dialog_DrawText(void) {
     }
     Flash_ClipGetPos(flash, &ref, &x, &y);
     alpha = Flash_ClipGetAlpha(flash, &ref);
-    str = DIALOG_TEXT(gDialog->msgTbl, gDialog->msgIdx);
+    str = DIALOG_TRANSLATE(gDialog->msgTbl, gDialog->msgIdx, DIALOG_TEXT(gDialog->msgTbl, gDialog->msgIdx));
     lines = Font_CountLines(str);
     switch (gDialog->size) {
     case 0:
@@ -154,7 +164,7 @@ void Dialog_DrawTitle(void) {
     }
     Flash_ClipGetPos(flash, &ref, &x, &y);
     alpha = Flash_ClipGetAlpha(flash, &ref);
-    str = DIALOG_TEXT(gDialog->titleTbl, gDialog->titleIdx);
+    str = DIALOG_TRANSLATE(gDialog->titleTbl, gDialog->titleIdx, DIALOG_TEXT(gDialog->titleTbl, gDialog->titleIdx));
     Font_PushStyle();
     Font_SetAlign(1);
     Font_SetScaleXY(1.0f, 1.0f);
@@ -189,7 +199,7 @@ void Dialog_DrawBody(void) {
     }
     Flash_ClipGetPos(flash, &ref, &x, &y);
     alpha = Flash_ClipGetAlpha(flash, &ref);
-    str = DIALOG_TEXT(gDialog->titleTbl, gDialog->msgIdx);
+    str = DIALOG_TRANSLATE(gDialog->titleTbl, gDialog->msgIdx, DIALOG_TEXT(gDialog->titleTbl, gDialog->msgIdx));
     switch (Font_CountLines(str)) {
     case 1:
         y += 0x28;
@@ -321,8 +331,18 @@ rect.y0 = i * 0x20;
         break;
     }
     gDialog->res.tex0 = visible != 0 ? gDialog->tex0 : NULL;
+#ifdef PORT
+    if (gPortMenuMode) {
+        Port_MenuPage(50); /* widescreen menus: the dialog a page of its own, at its true shape (port/src/gs_marker.c) */
+    }
+#endif
     Flash_Draw(gDialog->flash);
     Font_FlushAll();
+#ifdef PORT
+    if (gPortMenuMode) {
+        Port_MenuPage(0);
+    }
+#endif
 }
 
 /* Opens (0), closes (1) or shows without animation-in (2) the window; open and close play SE 4 / 5. */

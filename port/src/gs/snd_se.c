@@ -35,6 +35,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "gs_internal.h"
+#include "../port_addr.h"
 
 #define SPU_SIZE 0x200000
 #define VOICES 48
@@ -50,8 +51,9 @@ static float se_gain(void) {
     }
     return g;
 }
-extern int gPortSePercent; /* the settings overlay's volume (snd_adx.c); takes effect with the next sound */
-#define SE_GAIN (se_gain() * (float)gPortSePercent / 100.0f)
+/* The settings overlay's volumes (snd_adx.c), by bank slot; they take effect with the next sound. */
+extern int gPortSePercent, gPortVoicePercent, gPortStagePercent;
+#define SE_GAIN(slot) (se_gain() * (float)((slot) == 3 ? gPortStagePercent : (slot) == 4 || (slot) == 5 ? gPortVoicePercent : gPortSePercent) / 100.0f)
 
 typedef struct Bank {
     int set;
@@ -73,9 +75,14 @@ typedef struct Voice {
     float gl, gr;
     float fade;                /* 1 = playing; goes down to 0 after a stop */
     int stopping;
+    unsigned serial;           /* which start of an effect this voice plays (sHeard) */
 } Voice;
 
-static uint8_t sSpu[SPU_SIZE];
+/* Beside the sound chip's memory: room for the clip banks this copy plays in the place of the game's (voice_own_bank). */
+#define OWN_SLOT 0x100000 /* a megabyte each; the largest voice bank file of the disc has 591,104 bytes */
+#define SPU_TOTAL (SPU_SIZE + 8 * OWN_SLOT)
+static uint8_t sSpu[SPU_TOTAL];
+static uint8_t *sOwnTables[8]; /* the two tables of such a bank (one allocation) */
 static Bank sBanks[8];
 static Voice sVoices[VOICES];
 static SDL_AudioStream *sStream;
@@ -123,7 +130,7 @@ static int lookup(const Bank *b, int id, uint32_t *start, uint32_t *rate) {
     o = le32(vagi + 0x10 + 4 * vag);
     *start = b->spu + le32(vagi + o);
     *rate = le16(vagi + o + 4);
-    return *start + 16 <= SPU_SIZE && *rate != 0;
+    return *start + 16 <= SPU_TOTAL && *rate != 0;
 }
 
 /* Decodes the voice's next 16-byte block into v->buf. */
@@ -132,7 +139,7 @@ static void decode_block(Voice *v) {
     const uint8_t *p;
     int shift, filter, flags, i;
 
-    if (v->last || v->pos + 16 > SPU_SIZE) {
+    if (v->last || v->pos + 16 > SPU_TOTAL) {
         v->ended = 1;
         v->have = 0;
         return;
@@ -301,13 +308,130 @@ static int slot_of(int mask) {
     return -1;
 }
 
+/* The effects started in each of the last blanks of an online match with rollback, and the voice each one plays.
+   A blank run again after the other player's real input came:
+     - an effect it starts that was heard when the blank was first run is not started a second time; the voice
+       playing it takes the handle the game gave it now (the game's handles count the effects started, and the
+       blanks before may have started others this time, so a later stop by handle names the new one);
+     - an effect it starts that was not heard is started then, a few blanks late: an effect of what that input
+       changed (their vanish, a counter) was never heard, as the first run had a guess;
+     - when the run again is over, an effect heard the first time that it did not start again is stopped: it came
+       from the wrong guess (a ki charge the other player had let go of: its sound loops until it is stopped). */
+#define HEARD_BLANKS 32 /* (more than the most blanks run again: net.c's rollback goes back at most 8) */
+#define HEARD_EACH 32   /* (the most effects the game starts in a blank: one queue) */
+static struct {
+    unsigned tick;
+    int n;
+    uint8_t slot[HEARD_EACH], id[HEARD_EACH], used[HEARD_EACH];
+    uint8_t voice[HEARD_EACH];
+    unsigned serial[HEARD_EACH];
+} sHeard[HEARD_BLANKS];
+static unsigned sSerial;
+
+/* net.c: blank `tick` of an online match with rollback is about to be run for the first time. */
+void PortSe_BlankBegins(unsigned tick) {
+    sHeard[tick % HEARD_BLANKS].tick = tick;
+    sHeard[tick % HEARD_BLANKS].n = 0;
+}
+
+/* net.c: blanks first..live - 1 have been run again; blank `live` is the present again. */
+void PortSe_RunAgainEnds(unsigned first, unsigned live) {
+    unsigned t;
+    int k, kept;
+
+    if (live - first > HEARD_BLANKS) {
+        first = live - HEARD_BLANKS;
+    }
+    if (sStream != NULL) { SDL_LockAudioStream(sStream); }
+    for (t = first; t != live; t++) {
+#define H sHeard[t % HEARD_BLANKS]
+        if (H.tick != t) {
+            continue;
+        }
+        for (k = kept = 0; k < H.n; k++) {
+            if (!H.used[k]) { /* heard the first time, not started this time */
+                Voice *v = &sVoices[H.voice[k]];
+                if (v->on && v->serial == H.serial[k]) {
+                    v->stopping = 1;
+                    if (getenv("BT3_SND_VERBOSE") != NULL) {
+                        fprintf(stderr, "se: blank %u run again: bank %d effect %d not started this time, stopped\n", t, H.slot[k], H.id[k]);
+                    }
+                }
+                continue;
+            }
+            H.slot[kept] = H.slot[k];
+            H.id[kept] = H.id[k];
+            H.voice[kept] = H.voice[k];
+            H.serial[kept] = H.serial[k];
+            H.used[kept] = 0; /* (what this run started: what a later run again is compared with) */
+            kept++;
+        }
+        H.n = kept;
+#undef H
+    }
+    if (sStream != NULL) { SDL_UnlockAudioStream(sStream); }
+}
+
+/* 1 when this start of an effect is not to be heard: the blank runs without sound, or it is only being run again
+   and it started the same effect the first time (each one heard then is matched once). */
+static int muted(int slot, int id, int handle) {
+    extern int Port_NetResim(void);    /* net.c */
+    extern unsigned Port_NetTick(void);
+    unsigned tick;
+    int k;
+
+    if (!gPortResim) {
+        return 0;
+    }
+    if (!Port_NetResim()) {
+        return 1; /* (an online match's start-up, the sync test: run without sound) */
+    }
+    tick = Port_NetTick();
+    if (sHeard[tick % HEARD_BLANKS].tick != tick) {
+        return 1; /* (too far back) */
+    }
+#define H sHeard[tick % HEARD_BLANKS]
+    for (k = 0; k < H.n; k++) {
+        if (!H.used[k] && H.slot[k] == slot && H.id[k] == id) {
+            Voice *v = &sVoices[H.voice[k]];
+            H.used[k] = 1;
+            if (v->on && v->serial == H.serial[k]) {
+                v->handle = handle;
+            }
+            return 1;
+        }
+    }
+#undef H
+    if (getenv("BT3_SND_VERBOSE") != NULL) {
+        fprintf(stderr, "se: blank %u run again: bank %d effect %d was not heard the first time, started now\n", tick, slot, id);
+    }
+    return 0;
+}
+
+/* Notes the effect a voice was started for in this blank of an online match with rollback. */
+static void heard(int slot, int id, int voice) {
+    extern unsigned Port_NetTick(void); /* net.c */
+    unsigned tick = Port_NetTick();
+
+#define H sHeard[tick % HEARD_BLANKS]
+    if (H.tick == tick && H.n < HEARD_EACH) {
+        H.slot[H.n] = (uint8_t)slot;
+        H.id[H.n] = (uint8_t)id;
+        H.voice[H.n] = (uint8_t)voice;
+        H.serial[H.n] = sVoices[voice].serial;
+        H.used[H.n] = (uint8_t)(gPortResim != 0); /* (started late: matched already when this run again ends) */
+        H.n++;
+    }
+#undef H
+}
+
 static void play(int mask, int id, int volume, int pan, int pitch, int handle) {
     int slot = slot_of(mask), k, pick = -1;
     uint32_t start, rate;
     double theta;
     Voice *v;
 
-    if (slot < 0 || !sBanks[slot].set || !lookup(&sBanks[slot], id, &start, &rate)) {
+    if (slot < 0 || muted(slot, id, handle) || !sBanks[slot].set || !lookup(&sBanks[slot], id, &start, &rate)) {
         return;
     }
     for (k = 0; k < VOICES; k++) {
@@ -331,9 +455,11 @@ static void play(int mask, int id, int volume, int pan, int pitch, int handle) {
     v->frac = 0.0;
     v->fade = 1.0f;
     theta = (sMono ? 0.5 : (double)pan / 127.0) * 1.5707963267948966;
-    v->gl = (float)(cos(theta) * 1.41421356) * ((float)volume / 127.0f) * sBanks[slot].volume * SE_GAIN;
-    v->gr = (float)(sin(theta) * 1.41421356) * ((float)volume / 127.0f) * sBanks[slot].volume * SE_GAIN;
+    v->gl = (float)(cos(theta) * 1.41421356) * ((float)volume / 127.0f) * sBanks[slot].volume * SE_GAIN(slot);
+    v->gr = (float)(sin(theta) * 1.41421356) * ((float)volume / 127.0f) * sBanks[slot].volume * SE_GAIN(slot);
     v->on = 1;
+    v->serial = ++sSerial;
+    heard(slot, id, pick);
     if (getenv("BT3_SND_VERBOSE") != NULL) {
         fprintf(stderr, "se: play bank %d effect %d: %u Hz, volume %d, pan %d, pitch %d, handle %d\n", slot, id, rate, volume, pan, pitch, handle);
     }
@@ -353,6 +479,119 @@ static void stop(int mask, int id, int handle) {
 
 /* ------------------------------------------------------------ what the game calls (Sony's library functions) */
 
+/* The fighters' voices in an online match, for a player who chose the second voice set (see snd_adx.c: the match
+   itself computes with the default set). The game loads the default set's bank of a fighter (file 0xC7B + fighter
+   of partition 1) and names clips by number; the game never asks whether a clip is still playing, and the two sets'
+   banks have the same clips under the same numbers (checked for all 161 fighters: as many samples, as many
+   sequences). So the bank the game sets is recognised by the start of its header table and this copy plays the
+   same numbers from the other set's bank (file 0xBDA + fighter), read here from the disc's files. */
+extern int Port_FilePath(int ptid, int flid, const char *fname, char *out, int size); /* plat_file.c */
+#define VOICE_BANKS 161
+#define VOICE_BANK_DEFAULT (0xC7B - 1) /* file numbers of partition 1 (id - 1) */
+#define VOICE_BANK_OTHER (0xBDA - 1)
+
+static uint8_t *bank_file(int flid, long *size) {
+    char path[512];
+    uint8_t *b = NULL;
+    FILE *fp;
+
+    if (!Port_FilePath(1, flid, NULL, path, sizeof(path)) || (fp = fopen(path, "rb")) == NULL) {
+        return NULL;
+    }
+    fseek(fp, 0, SEEK_END);
+    *size = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    if (*size > 0x50 && (b = malloc((size_t)*size)) != NULL && fread(b, 1, (size_t)*size, fp) != (size_t)*size) {
+        free(b);
+        b = NULL;
+    }
+    fclose(fp);
+    return b;
+}
+
+/* The three parts of a bank file: a count and the parts' offsets at its start. Which is which is told by the chunk
+   names. 0 = not such a file. */
+static int bank_parts(const uint8_t *b, long size, uint32_t *hd, uint32_t *hdSize, uint32_t *sq, uint32_t *sqSize, uint32_t *smp, uint32_t *smpSize) {
+    uint32_t n = le32(b), i;
+    int have = 0;
+
+    if (n != 3) {
+        return 0;
+    }
+    for (i = 0; i < 3; i++) {
+        uint32_t o = le32(b + 4 + 4 * i), e = le32(b + 8 + 4 * i);
+        if (o >= e || e > (uint32_t)size) {
+            return 0;
+        }
+        if (chunk(b + o, "Vagi", e - o < 0x8000 ? e - o : 0x8000) != NULL) {
+            *hd = o; *hdSize = e - o; have |= 1;
+        } else if (chunk(b + o, "Sesq", e - o < 0x4000 ? e - o : 0x4000) != NULL) {
+            *sq = o; *sqSize = e - o; have |= 2;
+        } else {
+            *smp = o; *smpSize = e - o; have |= 4;
+        }
+    }
+    return have == 7;
+}
+
+/* Bank slot `slot` was just set by the game: if it is a fighter's default voice bank and this player chose the other
+   voice set, the slot plays that set's bank. */
+static void voice_own_bank(int slot) {
+    extern int Port_NetVoiceAlt(void); /* net.c */
+    /* each default bank's header table, whole: the first 64 bytes alone are the same for two fighters' banks (3 and
+       122: Goku (End) and Turles Great Ape), and the first of them was taken for both until 0.1.38 */
+    static struct { uint8_t *hd; uint32_t size; } *sig;
+    static int tried;
+    Bank *bk = &sBanks[slot];
+    int c, found = -1;
+    long size;
+    uint8_t *b;
+    uint32_t hd, hdSize, sq, sqSize, smp, smpSize;
+
+    free(sOwnTables[slot]);
+    sOwnTables[slot] = NULL;
+    if (!Port_NetVoiceAlt() || bk->hd == NULL) {
+        return;
+    }
+    if (!tried) {
+        tried = 1;
+        sig = calloc(VOICE_BANKS, sizeof(*sig));
+        for (c = 0; sig != NULL && c < VOICE_BANKS; c++) {
+            if ((b = bank_file(VOICE_BANK_DEFAULT + c, &size)) != NULL) {
+                if (bank_parts(b, size, &hd, &hdSize, &sq, &sqSize, &smp, &smpSize) && hdSize >= 64 &&
+                    (sig[c].hd = malloc(hdSize)) != NULL) {
+                    memcpy(sig[c].hd, b + hd, hdSize);
+                    sig[c].size = hdSize;
+                }
+                free(b);
+            }
+        }
+    }
+    for (c = 0; sig != NULL && c < VOICE_BANKS && found < 0; c++) {
+        /* (the first 64 bytes first: the game's table may be a shorter one, of another bank) */
+        if (sig[c].hd != NULL && memcmp(sig[c].hd, bk->hd, 64) == 0 && memcmp(sig[c].hd, bk->hd, sig[c].size) == 0) {
+            found = c;
+        }
+    }
+    if (found < 0 || (b = bank_file(VOICE_BANK_OTHER + found, &size)) == NULL) {
+        return; /* not a fighter's voice bank (the common effects, a stage's), or the other set has none */
+    }
+    if (bank_parts(b, size, &hd, &hdSize, &sq, &sqSize, &smp, &smpSize) && smpSize <= OWN_SLOT &&
+        (sOwnTables[slot] = malloc(hdSize + sqSize)) != NULL) {
+        memcpy(sOwnTables[slot], b + hd, hdSize);
+        memcpy(sOwnTables[slot] + hdSize, b + sq, sqSize);
+        memcpy(&sSpu[SPU_SIZE + (uint32_t)slot * OWN_SLOT], b + smp, smpSize);
+        memset(&sSpu[SPU_SIZE + (uint32_t)slot * OWN_SLOT] + smpSize, 0, OWN_SLOT - smpSize);
+        bk->spu = SPU_SIZE + (uint32_t)slot * OWN_SLOT;
+        bk->hd = sOwnTables[slot];
+        bk->sq = sOwnTables[slot] + hdSize;
+        if (getenv("BT3_SND_VERBOSE") != NULL) {
+            fprintf(stderr, "se: bank slot %d is fighter %d's voices: playing the other voice set's bank\n", slot, found);
+        }
+    }
+    free(b);
+}
+
 /* the game's structure: its two pointers are 4 bytes wide in every build (PS2 layout) */
 typedef struct SifDmaData { uint32_t data, addr; int32_t size, mode; } SifDmaData;
 
@@ -362,7 +601,7 @@ uint32_t sceSifSetDma(SifDmaData *d, int count) {
 
     for (i = 0; i < count; i++) {
         if (d[i].addr != 0 && d[i].data != 0 && d[i].size > 0) {
-            memcpy((void *)(uintptr_t)d[i].addr, (void *)(uintptr_t)d[i].data, (size_t)d[i].size);
+            memcpy(Port_Ptr(d[i].addr), Port_Ptr(d[i].data), (size_t)d[i].size);
         }
     }
     return 1;
@@ -370,7 +609,32 @@ uint32_t sceSifSetDma(SifDmaData *d, int count) {
 
 /* sceSdRemote (0x2967C0 in the PS2 executable). Used for two things: 0x80D0 = transfer `size` bytes at `iopAddr`
    into the sound chip's memory at `spuAddr`; 0x80F0 = is the transfer over (always: it is done at once). */
+#ifdef __APPLE__
+/* The game declares this one with `...` (src/sys/snd.c: it is called with 4 and with 7 arguments), and on Apple's
+   arm64 the arguments after the `...` travel on the stack, not in registers: read them as such. */
+#include <stdarg.h>
+static int sd_remote(int block, int cmd, int core, int mode, void *iopAddr, uint32_t spuAddr, uint32_t size);
+int func_002967C0(int block, int cmd, ...) {
+    va_list ap;
+    int core, mode;
+    void *iopAddr = NULL;
+    uint32_t spuAddr = 0, size = 0;
+
+    va_start(ap, cmd);
+    core = va_arg(ap, int);
+    mode = va_arg(ap, int);
+    if (cmd == 0x80D0) {
+        iopAddr = va_arg(ap, void *);
+        spuAddr = va_arg(ap, uint32_t);
+        size = va_arg(ap, uint32_t);
+    }
+    va_end(ap);
+    return sd_remote(block, cmd, core, mode, iopAddr, spuAddr, size);
+}
+static int sd_remote(int block, int cmd, int core, int mode, void *iopAddr, uint32_t spuAddr, uint32_t size) {
+#else
 int func_002967C0(int block, int cmd, int core, int mode, void *iopAddr, uint32_t spuAddr, uint32_t size) {
+#endif
     (void)block; (void)core; (void)mode;
     if (cmd == 0x80D0) {
         if (iopAddr != NULL && spuAddr < SPU_SIZE && size <= SPU_SIZE - spuAddr) {
@@ -407,10 +671,11 @@ int sceSifCallRpc(void *client, int fno, int mode, void *send, int sendSize, voi
         if (slot >= 0) {
             sBanks[slot].set = 1;
             sBanks[slot].spu = (uint32_t)w[1];
-            sBanks[slot].hd = (const uint8_t *)(uintptr_t)(uint32_t)w[2];
-            sBanks[slot].sq = (const uint8_t *)(uintptr_t)(uint32_t)w[3];
+            sBanks[slot].hd = (const uint8_t *)Port_Ptr((uint32_t)w[2]);
+            sBanks[slot].sq = (const uint8_t *)Port_Ptr((uint32_t)w[3]);
             sBanks[slot].paused = 0;
             if (sBanks[slot].volume == 0.0f) { sBanks[slot].volume = 1.0f; }
+            voice_own_bank(slot);
         }
         break;
     }

@@ -207,7 +207,8 @@ def port_sources():
     out = [(ROOT / "src/port/vu0_a.c", "vu0"), (ROOT / "src/port/vu0_b.c", "vu0")]
     # of port/src: everything but the PC's memory, files, crash report and maths bridge (vita_*.c take their place)
     for n in ("gs_marker", "headless", "mathf_pc", "plat_gs", "plat_mc", "plat_movie", "plat_mpeg2",
-              "plat_settings", "plat_stub", "plat_sys", "softfloat_ps2", "port_fast", "port_vufast"):
+              "plat_settings", "plat_stub", "plat_sys", "softfloat_ps2", "port_fast", "port_vufast",
+              "bt3_gameplay_rules", "bt3_zcounter2", "bt3_bombardment", "plat_sndstate"):  # (the last four: the PC port's, 0.1.39)
         out.append((S / (n + ".c"), "gs" if n in ("plat_movie", "plat_mpeg2") else "ee"))
     out += [(V / "vita_mem.c", "hard"), (V / "vita_file.c", "hard"), (V / "vita_main.c", "hard"), (V / "vita_float.c", "hard"),
             (GEN / "vita_dat.c", "hard"), (S / "gs/gs_sony.c", "hard"),
@@ -216,7 +217,9 @@ def port_sources():
             (V / "vita_perf.c", "hard"), (V / "vita_vgl.c", "hard"), (V / "vita_touch.c", "hard"), (V / "vita_optart.c", "hard"),
             (V / "vita_text.c", "hard"), (V / "vita_audio.c", "gs"), (S / "gs/snd_adx.c", "gs"), (S / "gs/snd_se.c", "gs"),
             (V / "vita_vufast_wrap.c", "hard"), (V / "vita_tls.c", "hard"), (V / "vita_clib.c", "hard"),
-            (V / "vita_read.c", "hard"), (V / "vita_pgo.c", "hard")]
+            (V / "vita_read.c", "hard"), (V / "vita_pgo.c", "hard"),
+            # what the PC port's other files give the game, answered as the game without them (vita_pc.c)
+            (V / "vita_pc.c", "hard")]
     return out
 
 
@@ -254,7 +257,7 @@ def cc_libm(f):
 def float_expected():
     """vita_float_expected.h: the reference sums of the float self-test (vita_float.c), computed on the host."""
     ren = [f"-D__{n}=PortX_{n}" for n in X_DEFS] + [f"-D{a}={b}" for a, b in RENAME_SOFTFLOAT.items()]
-    cc = ["gcc", "-O2", "-w", "-Iinclude", "-Iport/include", "-Iport/vita"]
+    cc = ["gcc", "-O2", "-w", "-Iinclude", "-Iport/include", "-Iport/src", "-Iport/vita"]
     for src, extra, o in (("port/src/softfloat_ps2.c", ren, "ft_soft.o"), ("src/port/vu0_a.c", ["-DREF_VU0_EXTERN_ARITH"], "ft_vu0.o"),
                           ("port/vita/floattest.c", [], "ft_main.o")):
         subprocess.run(cc + extra + ["-c", src, "-o", str(GEN / o)], cwd=ROOT, check=True)
@@ -277,7 +280,7 @@ def compile_all():
         print(f"profile counts: {n} files from {PGO_DIR}")
         if n == 0:
             raise SystemExit(f"BT3_PGO=use: no counts in {PGO_DIR} (port/vita/pgo_merge.sh)")
-    with concurrent.futures.ProcessPoolExecutor(os.cpu_count() or 4) as ex:
+    with concurrent.futures.ProcessPoolExecutor(int(os.environ.get("BT3_JOBS") or 0) or os.cpu_count() or 4) as ex:
         res = list(ex.map(cc_game, portsrc.sources()))
         res += list(ex.map(cc_libm, sorted((ROOT / "port/third_party/newlib_libm").glob("*.c"))))
         res += list(ex.map(cc_port, port_sources()))

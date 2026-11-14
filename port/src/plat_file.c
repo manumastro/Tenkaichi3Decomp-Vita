@@ -12,16 +12,24 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "plat_stages.h"
+#include "plat_songs.h"
 
 #define SECTOR 2048
 enum { STAT_STOP = 1, STAT_READING = 2, STAT_READEND = 3, STAT_ERROR = 4 };
 
+/* What the game holds for an open file. Only what can be saved and restored with the game's state: which file, its
+   size, the read position, the status. The host's own file objects are in plat_fcache.c. */
 typedef struct PortFile {
-    FILE *fp;
+    char rel[128];
     int32_t sizeSct;
     int32_t posSct;
     int32_t stat;
 } PortFile;
+
+extern long Port_FileSize(const char *rel); /* plat_fcache.c */
+extern void Port_TestSlow(int what, int amount); /* gs/net.c: testing, a machine that is slow at this */
+extern size_t Port_FileReadAt(const char *rel, long offset, void *buf, size_t bytes);
 
 static char sPartDir[8][64];
 char gPortMoviePath[512]; /* host path of the movie file opened last */
@@ -33,28 +41,54 @@ static const char *root(void) {
     const char *r = getenv("BT3_DATA");
     return r != NULL ? r : "gamedata";
 }
+const char *Port_FileRoot(void) { return root(); }
 
-static PortFile *open_rel(const char *rel) {
-    char path[512];
-    FILE *fp;
-    PortFile *f;
-    long size;
+/* BT3_FILE_ALIAS="rel=target;rel=target": a file the game asks for (its path under the data root) served from
+   somewhere else. A missing archive entry (a new id) gets a host file this way. The manifest of added stages
+   (port/plat_stages.c) is checked first. */
+static const char *alias_target(const char *rel) {
+    static char buf[512];
+    const char *list = getenv("BT3_FILE_ALIAS");
+    const char *p, *eq, *end;
+    size_t rl = strlen(rel);
 
-    snprintf(path, sizeof(path), "%s/mods/%s", root(), rel);
-    fp = fopen(path, "rb");
-    if (fp == NULL) {
-        snprintf(path, sizeof(path), "%s/%s", root(), rel);
-        fp = fopen(path, "rb");
+    if (PortStages_Alias(rel, buf, sizeof(buf))) {
+        return buf;
     }
-    if (fp == NULL) {
-        fprintf(stderr, "bt3: file not found: %s\n", path);
+    if (PortSongs_Alias(rel, buf, sizeof(buf))) {
+        return buf;
+    }
+    if (list == NULL) {
         return NULL;
     }
-    fseek(fp, 0, SEEK_END);
-    size = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
+    for (p = list; *p != '\0'; p = end + 1) {
+        eq = strchr(p, '=');
+        end = strchr(p, ';');
+        if (eq == NULL || (end != NULL && eq > end)) {
+            if (end == NULL) break;
+            continue;
+        }
+        if ((size_t)(eq - p) == rl && strncmp(p, rel, rl) == 0) {
+            size_t n = end != NULL ? (size_t)(end - (eq + 1)) : strlen(eq + 1);
+            if (n >= sizeof(buf)) n = sizeof(buf) - 1;
+            memcpy(buf, eq + 1, n);
+            buf[n] = '\0';
+            return buf;
+        }
+        if (end == NULL) break;
+    }
+    return NULL;
+}
+
+static PortFile *open_rel(const char *rel) {
+    PortFile *f;
+    long size = Port_FileSize(rel); /* (says so itself when the file is missing) */
+
+    if (size < 0) {
+        return NULL;
+    }
     f = Port_LowAlloc(sizeof(PortFile)); /* the game keeps the handle in a 4-byte pointer */
-    f->fp = fp;
+    snprintf(f->rel, sizeof(f->rel), "%s", rel);
     f->sizeSct = (int32_t)((size + SECTOR - 1) / SECTOR);
     f->stat = STAT_STOP;
     return f;
@@ -75,6 +109,20 @@ int Port_FilePath(int ptid, int flid, const char *fname, char *out, int size) {
         rel[n] = '\0';
     } else {
         snprintf(rel, sizeof(rel), "%s/%05d.bin", sPartDir[ptid & 7], flid);
+    }
+    {
+        /* The streamed audio (a song added from outside the disc) reads through this path, so the manifest's
+           aliases must apply here too, not only in open_rel. */
+        const char *a = alias_target(rel);
+        if (a != NULL) {
+            fp = fopen(a, "rb"); /* as it is (the songs folder next to the game) */
+            if (fp != NULL) {
+                fclose(fp);
+                snprintf(out, (size_t)size, "%s", a);
+                return 1;
+            }
+            snprintf(rel, sizeof(rel), "%s", a);
+        }
     }
     snprintf(out, (size_t)size, "%s/mods/%s", root(), rel);
     fp = fopen(out, "rb");
@@ -141,8 +189,7 @@ void ADXF_Close(void *h) {
     PortFile *f = h;
 
     if (f != NULL) {
-        fclose(f->fp);
-        Port_LowFree(f);
+        Port_LowFree(f); /* (the host's file stays open for a while: plat_fcache.c) */
     }
 }
 
@@ -155,10 +202,11 @@ int ADXF_ReadNw(void *h, int nsct, void *buf) {
     PortFile *f = h;
     size_t got;
 
+    Port_TestSlow(0, nsct);
     if (nsct > f->sizeSct - f->posSct) {
         nsct = f->sizeSct - f->posSct;
     }
-    got = fread(buf, 1, (size_t)nsct * SECTOR, f->fp);
+    got = Port_FileReadAt(f->rel, (long)f->posSct * SECTOR, buf, (size_t)nsct * SECTOR);
     memset((uint8_t *)buf + got, 0, (size_t)nsct * SECTOR - got);
     f->posSct += nsct;
     f->stat = STAT_READEND;

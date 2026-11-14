@@ -16,6 +16,7 @@
  * (Vita_MovieFrame): the game's buffer is not filled, and the upload of that buffer into GS memory, which the
  * game still sends every frame, is recognised by its address and not carried out (Vita_MovieDirect).
  */
+extern int Port_NetSession(void); /* gs/net.c: no movies in an online session */
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -108,7 +109,7 @@ static void movie_start(void) {
     sStarted = 1;
     sEnd = 1;
     /* without a window too when recorded input is played back: the movie has to take the same number of frames */
-    if ((!GsGpu_Enabled() && getenv("BT3_PAD_PLAY") == NULL) || gPortMoviePath[0] == '\0' || getenv("BT3_NOMOVIE") != NULL) {
+    if ((!GsGpu_Enabled() && getenv("BT3_PAD_PLAY") == NULL) || gPortMoviePath[0] == '\0' || getenv("BT3_NOMOVIE") != NULL || Port_NetSession()) {
         return;
     }
 #ifdef PORT_VITA

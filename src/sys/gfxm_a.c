@@ -119,6 +119,10 @@ void StgPanBlur_Init(s32 cbp) {
     }
 }
 
+#ifdef PORT
+extern int Port_FxOff(int bit); /* port/src/gs/gs_draw.c: an effect switched off in the settings window */
+#endif
+
 /* Updates the views (unless the battle is paused) and draws those with a strength. */
 void StgPanBlur_Draw(void) {
     s32 on0 = 1;
@@ -131,6 +135,11 @@ void StgPanBlur_Draw(void) {
             on0 = StgPanBlur_UpdateView(&gStgPanBlur->view[0]);
             on1 = StgPanBlur_UpdateView(&gStgPanBlur->view[1]);
         }
+#ifdef PORT /* (the setting "Movement blur": the views are kept up to date, nothing is drawn) */
+        if (Port_FxOff(32)) {
+            on0 = on1 = 0;
+        }
+#endif
         if (on0 != 0 || on1 != 0) {
             Dma_AddData(gStgPanBlur->tex.upload, 0x10);
             Dma_AddTexFlush();
@@ -149,6 +158,11 @@ void StgPanBlur_Draw(void) {
         if (!(Battle_GetWork()->flags & BATTLE_FLAG_PAUSE)) {
             on0 = StgPanBlur_UpdateView(&gStgPanBlur->view[0]);
         }
+#ifdef PORT
+        if (Port_FxOff(32)) {
+            on0 = 0;
+        }
+#endif
         if (on0 != 0) {
             Dma_AddData(gStgPanBlur->tex.upload, 0x10);
             Dma_AddTexFlush();
@@ -607,9 +621,14 @@ void StgPanBlur_RestoreEnv(void) {
    coordinates go through `s64` temporaries (so that the `|` with the V half is not narrowed to 32 bits and they
    step as 64-bit values), and the first corner's X comes from `i`, not from `x` (so the loop cannot be reversed
    before the second loop pass, which puts the counter's initial value behind that corner's). */
+#ifdef PORT
+extern void Port_GsMarker(s32 effect); /* port/src/gs_marker.c */
+#define PORT_GLOW_BEGIN 0x20 /* the PC renderer draws the chain's work pages at the PS2's resolution (gs_draw.c) */
+#define PORT_GLOW_END 0x21
 #ifdef PORT_VITA
-extern void Port_GsMarkerArg(s32 effect, u32 arg);
-extern void Port_GsMarker(s32 effect);
+extern void Port_GsMarkerArg(s32 effect, u32 arg); /* (Vita: markers 0x20..0x2F are the ground shadows' slots there,
+                                                      so the PC renderer's glow markers are not sent) */
+#endif
 #endif
 void GfxPost_DrawGlow(s32 passes, u32 color, u32 glow) {
     u64 *p;
@@ -623,6 +642,9 @@ void GfxPost_DrawGlow(s32 passes, u32 color, u32 glow) {
     Port_GsMarkerArg(0x41, glow);
 #endif
     passes += passes & 1;
+#if defined(PORT) && !defined(PORT_VITA)
+    Port_GsMarker(PORT_GLOW_BEGIN);
+#endif
     Gfx_AddDefaultEnv();
     p = Dma_BeginDirect();
     p[0] = GIF_TAG(13, 0, 1);
@@ -1039,7 +1061,9 @@ void GfxPost_DrawGlow(s32 passes, u32 color, u32 glow) {
     p += 2;
     Dma_EndDirect(p);
 #ifdef PORT_VITA
-    Port_GsMarker(0x42);
+    Port_GsMarker(0x42); /* (Vita) the glow's end (port/vita/vita_vgl.c, glow_exec) */
+#elif defined(PORT)
+    Port_GsMarker(PORT_GLOW_END);
 #endif
 }
 

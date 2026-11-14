@@ -106,6 +106,28 @@ s32 Progress_Main(s32 arg) {
             gProgress->mode = 56;
             gProgress->unk68C |= 1;
         }
+#ifdef PORT
+        {   /* Tenkaichi Budokai Online's sparring fight (Train While Waiting): its "Back to Budokai Online" goes back
+               to the search (menu/port_tbo.c) */
+            extern s32 gPortTboSpar;
+
+            if (gPortTboSpar && (reason & 0x10)) {
+                gPortScreen = PORT_SCREEN_TBO;
+                gProgress->mode = MPROG_MODE_PORT_SCREEN;
+            }
+            gPortTboSpar = 0;
+        }
+        {   /* A lobby's match (port/src/gs/net_lobby.c): "Return to Vs Menu", the owner's way back to the lobby window,
+               leaves for the main menu, which ends the session on every copy (there is no versus menu in it) */
+            extern int Port_NetLobbyOwnerSide(void);
+
+            if ((reason & 0x80) && Port_NetLobbyOwnerSide() >= 0) {
+                gProgress->flags &= ~MPROG_FLAG10;
+                gProgress->flags &= ~MPROG_FLAG20;
+                gProgress->mode = 4;
+            }
+        }
+#endif
     }
     if (gProgress->mode == 1 || gProgress->mode == 4) {
         if (gMenuArc1 == NULL) {
@@ -226,6 +248,13 @@ s32 Progress_Main(s32 arg) {
         case 70:
             Shen_Main();
             break;
+#ifdef PORT
+        case MPROG_MODE_PORT_SCREEN: /* the port's own screens (menu/port_screen.c) */
+            if (PortScreen_Main()) {
+                done = 1;
+            }
+            break;
+#endif
         }
     } while (!done);
 

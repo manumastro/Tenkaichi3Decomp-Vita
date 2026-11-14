@@ -1,5 +1,9 @@
 #include "common.h"
 #include "menu/menu_g.h"
+#ifdef PORT
+extern int Port_NetSession(void); /* port/src/gs/net.c */
+extern int Port_NetLobbyOwnerSide(void); /* port/src/gs/net.c: in a lobby's match, the owner's side; -1 otherwise */
+#endif
 
 /*
  * Duel_Main, 0x352CB8..0x352EC0: the handler of progress modes 38..41 (main-menu item 3, the duel mode).
@@ -51,6 +55,15 @@ s32 Duel_Main(void) {
                 Adx_StopAll();
                 bgm = 0;
                 gProgress->mode = 38;
+#ifdef PORT /* PC build, online session: there is no versus menu in it; going back leaves for the main menu, which
+               ends the session (as cancelling the versus menu does). In a lobby's match only its owner can go back
+               (menu_c_e.c, CharSel_PortLobbyHold): everyone is back in the lobby (port/src/gs/net_lobby.c). */
+                if (Port_NetSession()) {
+                    gProgress->mode = 4;
+                    result = 0;
+                    done = 1;
+                }
+#endif
             }
             break;
         case 40:
@@ -62,6 +75,18 @@ s32 Duel_Main(void) {
                 Adx_StopAll();
                 bgm = 0;
                 gProgress->mode = 38;
+#ifdef PORT /* PC build, online session: there is no versus menu in it; going back leaves for the main menu, which
+               ends the session (as cancelling the versus menu does). In a lobby's match only its owner ends the
+               session (port/src/gs/net_lobby.c), as from the character select; the team select goes back on the
+               first pad alone, so another's going back opens it again. */
+                if (Port_NetSession() && Port_NetLobbyOwnerSide() > 0) {
+                    gProgress->mode = 40;
+                } else if (Port_NetSession()) {
+                    gProgress->mode = 4;
+                    result = 0;
+                    done = 1;
+                }
+#endif
             }
             break;
         case 41:

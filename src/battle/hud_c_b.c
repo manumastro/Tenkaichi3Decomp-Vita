@@ -4,6 +4,15 @@
 #include "sys/randf.h"
 #include "sys/heap.h"
 
+#ifdef PORT
+/* PC build, online play: the player who joined is side 1 of the game, and would have their own gauges, team, prompts
+   and counters on the right. With the swap (gs/net.c) the two sides change places on THIS copy's screen only: a
+   side's data is the same, where it is drawn is the other side's place. HUD_SCR(side) is the place of a side. */
+extern int Port_HudSwap(void);
+#define HUD_SCR(side) ((side) ^ Port_HudSwap())
+#else
+#define HUD_SCR(side) (side)
+#endif
 /*
  * Battle HUD: the combo part, 0x222730-0x224B50 (the fifth part the manager builds, gHud->combo, from sprite
  * sheet 2). Per side it shows
@@ -116,7 +125,7 @@ void HudCombo_UpdateRoot(HudCNode *node) {
     if (!HUDC_PAUSED() && gHudCombo->side == 0) {
         Ramp_Step(&gHudCombo->hide);
     }
-    if (gHudCombo->side == 0) {
+    if (HUD_SCR(gHudCombo->side) == 0) {
         HudNode_SetPos(node, gHudCombo->hide.value * -256.0f, gHudCombo->hide.value * 0.0f);
     } else {
         HudNode_SetPos(node, gHudCombo->hide.value * 256.0f, gHudCombo->hide.value * 0.0f);
@@ -206,7 +215,7 @@ void HudCombo_UpdateMessage(HudCNode *node) {
     if (msg == 4) {
         pos[1] += 310.0f;
     }
-    if (gHudCombo->side == 0) {
+    if (HUD_SCR(gHudCombo->side) == 0) {
         HudNode_SetOfs(node, pos[0], pos[1]);
     } else {
         HudNode_SetOfs(node, 372 - (s32)pos[0], pos[1]);
@@ -280,7 +289,7 @@ void HudCombo_UpdateText(HudCNode *node) {
     }
     HudSprite_SetColor(spr, 0x80, 0x80, 0x80, alpha);
     pos[0] += 15.0f;
-    if (gHudCombo->side == 0) {
+    if (HUD_SCR(gHudCombo->side) == 0) {
         HudNode_SetOfs(node, pos[0], pos[1]);
     } else {
         HudNode_SetOfs(node, 512 - (s32)pos[0], pos[1]);
@@ -475,7 +484,7 @@ void HudCombo_UpdateDamage(HudCNode *node) {
         break;
     }
     pos[0] += 5.0f;
-    if (gHudCombo->side == 0) {
+    if (HUD_SCR(gHudCombo->side) == 0) {
         HudNode_SetOfs(node, pos[0], pos[1]);
     } else {
         HudNode_SetOfs(node, 372 - (s32)pos[0], pos[1]);
@@ -564,7 +573,7 @@ void HudCombo_UpdateHits(HudCNode *node) {
         break;
     }
     pos[0] += 5.0f;
-    if (gHudCombo->side == 0) {
+    if (HUD_SCR(gHudCombo->side) == 0) {
         HudNode_SetOfs(node, pos[0], pos[1]);
     } else {
         HudNode_SetOfs(node, 372 - (s32)pos[0], pos[1]);
@@ -614,12 +623,20 @@ extern void Port_GsMarker(s32 effect);
 void HudCombo_SelectSide(s32 side) {
     gHudCombo->side = side;
 #ifdef PORT
-    Port_GsMarker(side ? PORT_2D_RIGHT : PORT_2D_LEFT);
+    Port_GsMarker(HUD_SCR(side) ? PORT_2D_RIGHT : PORT_2D_LEFT);
 #endif
 }
 
+#ifdef PORT
+/* PC only: what the HUD is given, for HUDs drawn by the port (port/src/fight_panels.c Port_HudFeed: the script mods).
+   Presentation: nothing returns. */
+extern void Port_HudFeed(s32 kind, s32 side, s32 a, s32 b);
+#endif
 /* Starts message picture `message` (0..4) on a side. */
 void HudCombo_SetMessage(s32 side, s32 message) {
+#ifdef PORT
+    Port_HudFeed(5, side, message, 0);
+#endif
     gHudCombo->msgState[side] = 0;
     gHudCombo->msg[side] = message;
 }
@@ -642,6 +659,9 @@ void HudCombo_SetText(s32 side, s32 text) {
 void HudCombo_SetDamage(s32 side, s32 damage, s32 isNew) {
     HudCombo *w; /* the original reads gHudCombo once in front of the test and again (as written here) after it */
     f32 seconds;
+#ifdef PORT
+    Port_HudFeed(4, side, damage, isNew);
+#endif
 
     if (damage > HUD_COMBO_DAMAGE_MAX) {
         damage = HUD_COMBO_DAMAGE_MAX;
@@ -682,6 +702,9 @@ void HudCombo_SetDamage(s32 side, s32 damage, s32 isNew) {
 /* Gives the side's hit count. Below 2 the counter slides out; a count lower than the one on show slides it in
    anew, a higher one pops the digits. */
 void HudCombo_SetHits(s32 side, u32 hits) {
+#ifdef PORT
+    Port_HudFeed(3, side, (s32)hits, 0);
+#endif
     gHudCombo->hitsRaw[side] = hits;
     if (hits > HUD_COMBO_HITS_MAX) {
         hits = HUD_COMBO_HITS_MAX;
@@ -725,8 +748,14 @@ void HudCombo_DrawText(void) {
         f32 alpha = gHudCombo->textAlpha[side];
 
         if (pos[0] >= 0 && pos[1] >= 0) {
+#ifdef PORT
+            /* Widescreen: the text belongs to its side's panel. Both lines are drawn here, after both combo
+               trees, so the marker was still side 2's: player 1's technique name was narrowed about the right
+               edge and stood where it stands in 4:3, away from its panel (seen by the user). */
+            Port_GsMarker(HUD_SCR(side) ? PORT_2D_RIGHT : PORT_2D_LEFT);
+#endif
             BtlMenu_SetScript2(BtlCtrl_GetObj(side)->skillScript);
-            BtlText_DrawEntryName(pos[0], pos[1], gHudCombo->text[side], side, alpha);
+            BtlText_DrawEntryName(pos[0], pos[1], gHudCombo->text[side], HUD_SCR(side), alpha); /* (the 4th: left or right aligned) */
         }
     }
 }

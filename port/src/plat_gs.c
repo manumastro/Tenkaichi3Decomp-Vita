@@ -8,12 +8,13 @@
  * Headless build: the data is dropped. A renderer takes over in Port_DmaTransfer.
  */
 #include <stdint.h>
+#include "port_addr.h"
 
 #ifdef PORT_VITA /* the register block of port/vita/vita_mem.c (see PORT_HW in port_compat.h) */
 extern unsigned char gPortHw[];
 #define REG(a) ((volatile uint32_t *)(gPortHw + ((a) - 0x10000000u)))
 #else
-#define REG(a) ((volatile uint32_t *)(uintptr_t)(a))
+#define REG(a) ((volatile uint32_t *)Port_Ptr(a))
 #endif
 
 extern void Port_GsVif1Chain(uint32_t tadr, int tte);
