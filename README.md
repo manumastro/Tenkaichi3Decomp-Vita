@@ -129,14 +129,17 @@ On a PS TV, or with a DualShock paired, the controller's own L2, R2, L3 and R3 b
 
 ## Unlock All
 
-Hold SELECT as the game starts (press it right after starting the game from the LiveArea; holding it for the
-first few seconds is enough): a screen offers to unlock
-everything, every character and form, stage, song and item, and 4,850,000 Zenni, in your save as the game loads it.
-It is the game's own unlock routine (the developers left it in, never called; arielxflores's Vita port offers it the
-same way). The game keeps it when it saves next. Your save as it was is copied first to
-`ux0:data/bt3/saves/unlock_backup.bin`; holding SELECT at a later start offers to undo it (TRIANGLE), which puts that copy
-back (what was played since then is lost). The PS2's cheat codes (PCSX2 pnach, CodeBreaker) do nothing here: this is
-not an emulator.
+Two ways to open its screen:
+
+- **in the menus**: hold SELECT for two seconds (after your save is loaded, in the main menu for instance);
+- **at the start**: press SELECT as the game starts (a short press at any moment before its first picture is enough).
+
+CROSS gives your save everything: every character and form, stage, song and item, and 4,850,000 Zenni. It is the
+game's own unlock routine (the developers left it in, never called; arielxflores's Vita port offers it the same way).
+From the menus it is in your save at once; save in Options (or the game saves by itself after a fight) to keep it.
+Your save as it was is copied first to `ux0:data/bt3/saves/unlock_backup.bin`, and the same screen then offers to undo
+it (TRIANGLE), which puts that copy back (what was played since then is lost). The PS2's cheat codes (PCSX2 pnach,
+CodeBreaker) do nothing here: this is not an emulator.
 
 ## Mods
 
