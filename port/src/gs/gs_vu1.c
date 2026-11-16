@@ -785,12 +785,13 @@ __attribute__((hot)) static int hle_program2(void) {
         extern int gVitaBisect;
         /* bt3.txt silgate: nor while the renderer has not drawn into the shadow page nor read it for 60 frames (in the
            BT4 fork's 2 vs 2 fights the page is spoiled every picture: ~2,500 of these a list read, sent and drawn for
-           nothing); one frame in 16 sends them all, so that the page can come back into use */
+           nothing); one frame in silprobe (16) sends them all, so that the page can come back into use */
         extern int gVitaSilGate, gVitaAbSide;
         extern volatile unsigned gVglWpUsed;
         extern unsigned gGsFrame;
         extern unsigned gVitaSilGateN[2];
-        int gate = (gVitaSilGate == 2 ? gVitaAbSide == 1 : gVitaSilGate != 0) && gGsSplit && gGsFrame - gVglWpUsed > 60 && (gGsFrame & 15) != 0;
+        extern unsigned gVitaSilProbe; /* (bt3.txt silprobe: the frames between two that send them all, a power of two; 16) */
+        int gate = (gVitaSilGate == 2 ? gVitaAbSide == 1 : gVitaSilGate != 0) && gGsSplit && gGsFrame - gVglWpUsed > 60 && (gGsFrame & (gVitaSilProbe - 1)) != 0;
         int skip = gGsSplit && ((!gVglL2Drawn && (++n & 63) != 0) || gate);
         gVitaSilGateN[gate ? 0 : 1]++;
         if (skip && gVitaBisect == 2) {

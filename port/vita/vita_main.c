@@ -1004,11 +1004,26 @@ void Vita_VBlank(unsigned vblanks) {
                         memset(gVitaTexContN, 0, sizeof(gVitaTexContN));
                     }
                     {
-                        extern unsigned gVitaDpBusyL[2], gVitaSilGateN[2];
+                        extern unsigned gVitaDpBusyL[2], gVitaSilGateN[2], gVitaWtSigN[2], gVitaRtKickN[1];
                         logf_("vita:   kept parts not recorded (their place another's in use): %u; given their second place (dpways): %u | shadow-page strips held back (silgate): %u, gone through %u\n",
                               gVitaDpBusyL[0], gVitaDpBusyL[1], gVitaSilGateN[0], gVitaSilGateN[1]);
+                        logf_("vita:   targets' signatures taken as they were (wtsig): %u, worked out %u | kept parts handed over without waking the render thread (rtkick): %u\n",
+                              gVitaWtSigN[0], gVitaWtSigN[1], gVitaRtKickN[0]);
+                        {
+                            extern unsigned gVitaDpTexaN[2], gVitaTexRtN[3], gVitaFxClampN[2];
+                            extern void Gs_GifShapesLog(void);
+                            logf_("vita:   fxclamp: %u runs, %u triangles\n", gVitaFxClampN[0], gVitaFxClampN[1]);
+                            memset(gVitaFxClampN, 0, sizeof(gVitaFxClampN));
+                            Gs_GifShapesLog();
+                            logf_("vita:   kept forms without TEXA (dptexa): %u; parts walked whose kept form differed in TEXA alone: %u | texrt: %u pieces from the pools, %u made the old way, %u textures set up by the render thread\n",
+                                  gVitaDpTexaN[0], gVitaDpTexaN[1], gVitaTexRtN[0], gVitaTexRtN[1], gVitaTexRtN[2]);
+                            memset(gVitaDpTexaN, 0, sizeof(gVitaDpTexaN));
+                            memset(gVitaTexRtN, 0, sizeof(gVitaTexRtN));
+                        }
                         memset(gVitaDpBusyL, 0, sizeof(gVitaDpBusyL));
                         memset(gVitaSilGateN, 0, sizeof(gVitaSilGateN));
+                        gVitaRtKickN[0] = 0;
+                        memset(gVitaWtSigN, 0, sizeof(gVitaWtSigN));
                     }
                     gVitaRunEstN = 0;
                     memset(gVitaWtC, 0, sizeof(gVitaWtC));
@@ -1463,6 +1478,33 @@ static void read_settings(void) {
         } else if (strcmp(line, "silgate") == 0) { /* the shadow page's strips not sent while the page is not used: 0 off, 1 on, 2 soak B */
             extern int gVitaSilGate;
             gVitaSilGate = atoi(eq);
+        } else if (strcmp(line, "silprobe") == 0) { /* with silgate, one frame in this many sends the strips all (a power of two, 2-256; 16) */
+            extern unsigned gVitaSilProbe;
+            unsigned v = (unsigned)atoi(eq);
+            if (v >= 2 && v <= 256 && (v & (v - 1)) == 0) {
+                gVitaSilProbe = v;
+            }
+        } else if (strcmp(line, "wtsig") == 0) { /* the targets' signatures worked out only when GS memory changed: 0 off, 1 on, 2 soak B */
+            extern int gVitaWtSig;
+            gVitaWtSig = atoi(eq);
+        } else if (strcmp(line, "adfast") == 0) { /* GIF tags of A+D writes written in one loop: 0 off, 1 on, 2 soak B */
+            extern int gVitaAdFast;
+            gVitaAdFast = atoi(eq);
+        } else if (strcmp(line, "fxclamp") == 0) { /* the animated effects' triangles (with their CLAMP writes) as runs: 0 off, 1 on, 2 soak B */
+            extern int gVitaFxClamp;
+            gVitaFxClamp = atoi(eq);
+        } else if (strcmp(line, "gifshapes") == 0) { /* 1: the GIF tags outside the runs counted by shape, in the report (a measure) */
+            extern int gVitaGifShapes;
+            gVitaGifShapes = atoi(eq);
+        } else if (strcmp(line, "dptexa") == 0) { /* a kept part that cannot read TEXA does not compare it: 0 off, 1 on, 2 soak B */
+            extern int gVitaDpTexa;
+            gVitaDpTexa = atoi(eq);
+        } else if (strcmp(line, "texrt") == 0) { /* textures with a palette made without waiting for the render thread: 0 off, 1 on, 2 soak B */
+            extern int gVitaTexRt;
+            gVitaTexRt = atoi(eq);
+        } else if (strcmp(line, "rtkick") == 0) { /* the render thread not woken for every kept part: 0 off, 1 on, 2 soak B */
+            extern int gVitaRtKick;
+            gVitaRtKick = atoi(eq);
         } else if (strcmp(line, "texcont") == 0) { /* a texture found by its contents wherever GS memory holds them: 0 off, 1 on, 2 soak B */
             extern int gVitaTexCont;
             gVitaTexCont = atoi(eq);
