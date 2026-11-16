@@ -1260,6 +1260,7 @@ static GLuint sOlTex[3];       /* (the display buffers as textures, below) */
 extern unsigned int gxm_back_buffer_index;
 static int sTexXf;             /* the primitive's texture is a picture drawn here: its coordinates moved into it (put) */
 static float sTexXfV[4];       /* s' = [0] + s * [1], t' = [2] + t * [3] */
+static volatile unsigned sMemVramK, sMemRamK, sMemSeen; /* (the memory as last read; wt_swap, below) */
 extern unsigned gVitaOl[4];
 static void rt_sync(void); /* (the render thread's work all done; see rt_start) */
 static void rt_start(void);
@@ -2439,8 +2440,10 @@ static GLuint texture_get_k_(uint64_t t0raw, uint64_t texa) {
     {
         static unsigned made;
         if (made < 24 || made % 100 == 0) { /* (a line in the log costs more than the texture) */
-            Vita_Log("vgl: frame %u: texture %u: %u x %u, format %02x, at %04x; %d cached; free memory: %u KB video, %u KB main\n", gGsFrame, made, tw, th, psm, tbp,
-                     sTexCount, (unsigned)(vglMemFree(VGL_MEM_VRAM) >> 10), (unsigned)(vglMemFree(VGL_MEM_RAM) >> 10));
+            /* (the memory as last read: vglMemFree walks vitaGL's whole heap, sceClibMspaceMallocStats; in the BT4 fork's 2 vs
+               2 fights it took 40-66 ms here, for each of the first 24 textures made this way, in the release too) */
+            Vita_Log("vgl: frame %u: texture %u: %u x %u, format %02x, at %04x; %d cached; free memory (as last read): %u KB video, %u KB main\n", gGsFrame, made, tw, th, psm, tbp,
+                     sTexCount, sMemVramK, sMemRamK);
         }
         made++;
     }
@@ -2498,9 +2501,8 @@ unsigned long long gVitaWall[6];
 unsigned long long gVitaWallK[4][2]; /* draw submissions by kind: stage, fighters, other models, GS primitives: microseconds, count */
 static inline void *wt_map(GLenum t, GLenum a) { unsigned long long t0 = sceKernelGetProcessTimeWide(); void *r = glMapBuffer(t, a); gVitaWall[1] += sceKernelGetProcessTimeWide() - t0; return r; }
 static volatile int gVitaDrawWhere;
-/* (the watchdog: vitaGL's free memory as last looked at, once a second, by the drawing thread: the watchdog itself
-   calls nothing of vitaGL, which may be what is stuck) */
-static volatile unsigned sMemVramK, sMemRamK, sMemSeen;
+/* (sMemVramK, sMemRamK, declared above: the watchdog's and the log's vitaGL free memory as last looked at by the
+   drawing thread, wt_swap: the watchdog itself calls nothing of vitaGL, which may be what is stuck) */
 /* (the minute line of the log, vita_main.c: what the texture tables hold, read as they are, and the memory) */
 int Vita_VglTables(char *out, int size) {
     int k, idx = 0, pal = 0;
@@ -2522,7 +2524,10 @@ static inline void wt_swap(void) {
     pace_swap(1);
     gVitaDrawWhere = 0;
     gVitaWall[0] += sceKernelGetProcessTimeWide() - t0;
-    if (++sMemSeen % 60 == 0) {
+    extern int Vita_InBattle(void);
+    /* vglMemFree walks vitaGL's whole heap: 3 ms at a fight's start, 46 ms two minutes into a BT4 2 vs 2 one. It was
+       every 60th picture: in a fight now every 1024th, ~40 s */
+    if (++sMemSeen % (Vita_InBattle() ? 1024 : 64) == 0) {
         sMemVramK = (unsigned)(vglMemFree(VGL_MEM_VRAM) >> 10);
         sMemRamK = (unsigned)(vglMemFree(VGL_MEM_RAM) >> 10);
     }
