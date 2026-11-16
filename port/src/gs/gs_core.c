@@ -3575,6 +3575,19 @@ extern unsigned gVitaDp[8];
 unsigned gVitaDpMiss[34]; /* for the log: kept parts found in another state, by the first GS field that differed */
 #define DP_NF 34
 unsigned gVitaDpBusy; /* for the log: parts not recorded, their place (serial & sDpMask) another part's in use */
+unsigned gVitaDpBusyL[2]; /* (the log, the line printed always) the same; parts given their second place (dpways) */
+/* bt3.txt dpways: a part whose place (serial & sDpMask) is another part's in use takes a second place, its number
+   mixed (dp_alt). dp_pick_serial gives a new part a place not in use, but a part not drawn for 16 frames gives its
+   place up, and when it comes back while the new one lives one of the two was walked the long way every frame (in
+   the BT4 fork: ~420 parts a picture in a 2 vs 2 fight's beam special, 12-15 ms of the drawing thread's). 0 off, 1
+   on, 2 the soak's B */
+int gVitaDpWays;
+int gVitaSilGate;              /* bt3.txt silgate (gs_vu1.c): 0 off, 1 on, 2 the soak's B battles */
+unsigned gVitaSilGateN[2];     /* (the log) shadow-page strips held back by silgate, gone through */
+static inline int dpways_on(void) {
+    extern int gVitaAbSide;
+    return gVitaDpWays == 2 ? gVitaAbSide == 1 : gVitaDpWays != 0;
+}
 unsigned gVitaDpWalk[3]; /* for the log: parts walked as not to be recorded (kept parts off or their indices' room full), refused before; refused now as changing */
 /* what a kept part's match compares comes first and packed (n fields: their numbers, their values): the
    drawing thread looked it up in a 1 MB table, field by field across 272 bytes, 2,400 cycles a part */
@@ -3614,6 +3627,24 @@ static void dp_alloc(void) {
     }
 }
 static int sDpOn = -1;
+static inline uint32_t dp_alt(uint32_t serial) { /* a part's second place: never its first */
+    uint32_t a = ((serial * 0x9E3779B1u) >> 11) & sDpMask;
+    return a == (serial & sDpMask) ? a ^ 1u : a;
+}
+/* the place that holds the part numbered `serial`: its first, its second (dpways), or NULL */
+static inline DpSlot *dp_slot_of(uint32_t serial) {
+    DpSlot *s = &sDp[serial & sDpMask];
+    if (s->serial == serial) {
+        return s;
+    }
+    if (dpways_on()) {
+        s = &sDp[dp_alt(serial)];
+        if (s->serial == serial) {
+            return s;
+        }
+    }
+    return NULL;
+}
 
 /* A kept call's number, which also names its part's place (serial & sDpMask): the next number whose place is not
    another part's in use (drawn in the last 16 frames, as dp_cap_begin takes it) nor given out lately. The numbers
@@ -3741,8 +3772,8 @@ static int dp_part(uint32_t serial, const float *consts) {
         return 0;
     }
     sDpFrameNow = gVitaDpFrame == 2 ? gVitaAbSide == 1 : gVitaDpFrame != 0;
-    s = &sDp[serial & sDpMask];
-    if (s->serial != serial) {
+    s = dp_slot_of(serial);
+    if (s == NULL) {
         return 0;
     }
     {
@@ -3803,8 +3834,17 @@ static int dp_cap_begin(uint32_t serial) {
     }
     s = &sDp[serial & sDpMask];
     if (s->serial != serial && s->serial != 0 && sFrame - s->seen < 16) {
-        gVitaDpBusy++;
-        return 0; /* (the place is another part's, in use) */
+        DpSlot *a = dpways_on() ? &sDp[dp_alt(serial)] : NULL;
+        if (a != NULL && (a->serial == serial || a->serial == 0 || sFrame - a->seen >= 16)) {
+            s = a; /* (dpways: its second place, its own already, empty, or given up) */
+            gVitaDpBusyL[1]++;
+        } else {
+            gVitaDpBusy++;
+            gVitaDpBusyL[0]++;
+            return 0; /* (the place is another part's, in use) */
+        }
+    } else if (s->serial != serial && dpways_on() && sDp[dp_alt(serial)].serial == serial) {
+        s = &sDp[dp_alt(serial)]; /* (it lives in its second place: kept there) */
     }
     if (s->serial != serial) {
         int k2;
@@ -3827,7 +3867,7 @@ static int dp_cap_begin(uint32_t serial) {
     return 1;
 }
 static void dp_cap_end(uint32_t serial) {
-    DpSlot *s = &sDp[serial & sDpMask];
+    DpSlot *s = dp_slot_of(serial);
     DpForm *f;
     void *gpu = NULL;
     sDpCap = 0;
@@ -3836,7 +3876,7 @@ static void dp_cap_end(uint32_t serial) {
     } else {
         GsGpu_DpCapAbort();
     }
-    if (s->serial != serial) {
+    if (s == NULL) {
         GsGpu_DpFree(gpu);
         return;
     }

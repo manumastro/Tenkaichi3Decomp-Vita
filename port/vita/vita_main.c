@@ -1003,6 +1003,13 @@ void Vita_VBlank(unsigned vblanks) {
                         }
                         memset(gVitaTexContN, 0, sizeof(gVitaTexContN));
                     }
+                    {
+                        extern unsigned gVitaDpBusyL[2], gVitaSilGateN[2];
+                        logf_("vita:   kept parts not recorded (their place another's in use): %u; given their second place (dpways): %u | shadow-page strips held back (silgate): %u, gone through %u\n",
+                              gVitaDpBusyL[0], gVitaDpBusyL[1], gVitaSilGateN[0], gVitaSilGateN[1]);
+                        memset(gVitaDpBusyL, 0, sizeof(gVitaDpBusyL));
+                        memset(gVitaSilGateN, 0, sizeof(gVitaSilGateN));
+                    }
                     gVitaRunEstN = 0;
                     memset(gVitaWtC, 0, sizeof(gVitaWtC));
                 }
@@ -1450,6 +1457,12 @@ static void read_settings(void) {
         } else if (strcmp(line, "stx") == 0) { /* 0: no states kept from one picture to the next */
             extern int gVitaStXOn;
             gVitaStXOn = atoi(eq) != 0;
+        } else if (strcmp(line, "dpways") == 0) { /* a kept part's second place when its first is another's: 0 off, 1 on, 2 soak B */
+            extern int gVitaDpWays;
+            gVitaDpWays = atoi(eq);
+        } else if (strcmp(line, "silgate") == 0) { /* the shadow page's strips not sent while the page is not used: 0 off, 1 on, 2 soak B */
+            extern int gVitaSilGate;
+            gVitaSilGate = atoi(eq);
         } else if (strcmp(line, "texcont") == 0) { /* a texture found by its contents wherever GS memory holds them: 0 off, 1 on, 2 soak B */
             extern int gVitaTexCont;
             gVitaTexCont = atoi(eq);

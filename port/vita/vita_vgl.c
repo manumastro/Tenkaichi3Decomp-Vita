@@ -1262,6 +1262,7 @@ extern unsigned int gxm_back_buffer_index;
 static int sTexXf;             /* the primitive's texture is a picture drawn here: its coordinates moved into it (put) */
 static float sTexXfV[4];       /* s' = [0] + s * [1], t' = [2] + t * [3] */
 static volatile unsigned sMemVramK, sMemRamK, sMemSeen; /* (the memory as last read; wt_swap, below) */
+extern volatile unsigned gVglWpUsed; /* (the work page last used; below) */
 extern unsigned gVitaOl[4];
 static void rt_sync(void); /* (the render thread's work all done; see rt_start) */
 static void rt_start(void);
@@ -3890,6 +3891,7 @@ static int state_of_(int ctx, int type, State *d) {
                 return 0;
             }
             gVitaWp[3]++;
+            gVglWpUsed = gGsFrame;
             pageTex = 1;
             pageSlot = sWpAgain >= 0 ? sWpAgain : sWpSlot;
             if (sWpAgain < 0 && sWpSlot < WP_OTHER) {
@@ -4081,6 +4083,7 @@ static void flush_bins(void);
 static void flush_bins_c(int why);
 extern int gDpCapture;        /* (direct parts, below) */
 volatile int gVglL2Drawn;     /* a strip of program 2 (fighters' flat shadow / silhouette, layer 2) was drawn: gs_vu1.c sends them all */
+volatile unsigned gVglWpUsed; /* the frame the work page was last drawn into or read (gs_vu1.c silgate) */
 unsigned gVglL2[2];           /* for the log: layer-2 strips drawn, dropped */
 static int sDpRecBad, sDpItemN;
 static int sDsOn;             /* (direct strips, below) */
@@ -4805,6 +4808,7 @@ static void GsGpu_Draw_impl(int type, int ctx, const GsVertex *v) {
     }
     if (i && d.target) { /* into the work page: drawn as it is (none of the picture's shortcuts) */
         gVitaWp[0]++;
+        gVglWpUsed = gGsFrame;
         if (type == 6 && !d.tme && !d.blend && d.mask == 15) { /* a clear: the page whole again once it all is */
             float cx0 = v[0].x < 0.0f ? 0.0f : v[0].x, cx1 = v[1].x > 256.0f ? 256.0f : v[1].x;
             float cy0 = v[0].y < 0.0f ? 0.0f : v[0].y, cy1 = v[1].y > 256.0f ? 256.0f : v[1].y;
