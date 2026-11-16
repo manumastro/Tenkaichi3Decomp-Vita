@@ -163,7 +163,8 @@ static inline void bin_made(int b, const State *d) {
 }
 
 typedef struct Tex {
-    uint64_t tex0, texa;
+    uint64_t tex0, texa; /* (tex0: its key, without the image's and the palette's places with texcont; tex0a as the GS had it) */
+    uint64_t tex0a;
     uint32_t gen;
     unsigned last;
     GLuint id;
@@ -2093,7 +2094,7 @@ static int tex_layer(uint64_t t0, uint64_t texa) {
         return memoR;
     }
     for (k = 0; k < sTexCount; k++) {
-        if ((sTex[k].tex0 & 0x3FFFFFFFFull) == img && sTex[k].texa == texa && sTex[k].last + 3 >= gGsFrame) {
+        if ((sTex[k].tex0a & 0x3FFFFFFFFull) == img && sTex[k].texa == texa && sTex[k].last + 3 >= gGsFrame) {
             r = 1;
             break;
         }
@@ -2138,7 +2139,7 @@ static GLuint texture_get_k(uint64_t t0raw, uint64_t texa) {
             bound = 1;
             if (be->t0 == t0s && be->texa == texa && be->nT == nT && be->nC == nC && be->ti < sTexCount) {
                 Tex *c = &sTex[be->ti];
-                if (c->tex0 == t0s && c->texa == texa && c->gen == be->gen && c->id == be->id) {
+                if (c->tex0a == t0s && c->texa == texa && c->gen == be->gen && c->id == be->id) {
                     if ((++bindN & 63) != 0) {
                         c->last = gGsFrame;
                         sLast = c;
@@ -2174,7 +2175,7 @@ static GLuint texture_get_k(uint64_t t0raw, uint64_t texa) {
                 }
             }
         }
-        if (r != 0 && sLast != NULL && sLast->id == r && sLast->tex0 == t0s && sLast->texa == texa) {
+        if (r != 0 && sLast != NULL && sLast->id == r && sLast->tex0a == t0s && sLast->texa == texa) {
             be->t0 = t0s; be->texa = texa; be->nT = nT; be->nC = nC;
             be->ti = (int)(sLast - sTex); be->gen = sLast->gen; be->id = r;
             be->rid = rid; be->cid = cid;
@@ -2193,6 +2194,22 @@ static GLuint texture_get(int ctx) {
 }
 /* the texture of TEX0 `t0raw` and TEXA `texa` as GS memory holds it now */
 unsigned gVitaClutSub; /* for the log: textures made with the palette of the GS's last CLUT load (their CLD 0, CBP 0) */
+/* bt3.txt texcont: a texture found by its contents wherever GS memory holds them. The effects' images and palettes are
+   given their places in GS memory a frame at a time (eft_ae.c EftVram_Add*: a cursor from 0x2B00 / 0x2A00), so when
+   the set of effects on screen changes the same image comes at another place, and its key (TEX0 with the image's and
+   the palette's places) made it a new texture: 100-250 every 2 s in a 2 vs 2 fight's special moves, each made again
+   with its indices, its palette and waits for the render thread. With it on, the key leaves out TBP0 and CBP: the
+   contents are `gen` already (the ids of the blocks the image and the palette occupy, gs_core.c). 0 off, 1 on, 2 the
+   soak's B battles */
+int gVitaTexCont;
+unsigned gVitaTexContN[3]; /* (the log) textures found at another place than they were made at, made, looked up the long way */
+static inline int texcont_now(void) {
+    extern int gVitaAbSide;
+    return gVitaTexCont == 2 ? gVitaAbSide == 1 : gVitaTexCont != 0;
+}
+static inline uint64_t tex_key0(uint64_t t0, int cont) { /* TEX0 as the table's key: TBP0 (bits 0-13) and CBP (37-50) out with texcont */
+    return cont ? t0 & ~(0x3FFFull | 0x3FFFull << 37) : t0;
+}
 unsigned gVitaKeyPart[3]; /* texture keys whose texture's number was kept (its pages as they were), checked, found otherwise */
 static GLuint texture_get_k_(uint64_t t0raw, uint64_t texa) {
     static uint32_t px[1024 * 1024 / 4]; /* up to 512 x 512; larger textures are cut */
@@ -2211,15 +2228,16 @@ static GLuint texture_get_k_(uint64_t t0raw, uint64_t texa) {
     /* the keys made last, and the state of GS memory each was made in. Several: a fighter's strips alternate
        between two textures, and with one remembered key every strip made its key again (60 us, 7,000 times a
        picture: most of a drawn fight picture's time) */
-    static struct { uint64_t t0, texa; unsigned epoch; uint32_t gen, sig, gi, tsig; int valid; } sKey[256], *ke; /* (256, was 64; gi, tsig) */
+    static struct { uint64_t t0, texa; unsigned epoch; uint32_t gen, sig, gi, tsig; int valid, cont; } sKey[256], *ke; /* (256, was 64; gi, tsig; cont: texcont when made) */
     Tex *t;
+    const int cont = texcont_now();
 
     if (tw > 512) { tw = 512; }
     if (th > 512) { th = 512; }
     /* `gen` identifies the CONTENT: the ids of the blocks of GS memory the texture and its palette occupy
        (gs_core.c: uploads the game repeats give the same ids without being written again) */
     ke = &sKey[(uint32_t)((t0 ^ t0 >> 29 ^ texa) * 0x9E3779B1u) >> 24];
-    if (ke->valid && ke->t0 == t0 && ke->texa == texa && (ke->epoch == gGsEpoch || (gVitaBisect != 2 && ke->sig == tex_sig(t0) && (++sSigN & 3) != 0))) {
+    if (ke->valid && ke->t0 == t0 && ke->texa == texa && ke->cont == cont && (ke->epoch == gGsEpoch || (gVitaBisect != 2 && ke->sig == tex_sig(t0) && (++sSigN & 3) != 0))) {
         gen = ke->gen;
         ke->epoch = gGsEpoch;
     } else {
@@ -2252,7 +2270,7 @@ static GLuint texture_get_k_(uint64_t t0raw, uint64_t texa) {
             if (!Gs_DestRect(cbp, 1, cpsm, bits == 8 ? 16 : 8, bits == 8 ? 16 : 2, &cr)) {
                 cr = Gs_RectId(cbp, 1, cpsm, 0, 0, bits == 8 ? 16 : 8, bits == 8 ? 16 : 2);
             }
-            gen = (gen ^ cr) * 16777619u + cbp;
+            gen = (gen ^ cr) * 16777619u + (cont ? 0u : cbp); /* (texcont: the palette by its contents only) */
         }
         if (sigSame) {
             gVitaSigCheck[0]++;
@@ -2264,24 +2282,32 @@ static GLuint texture_get_k_(uint64_t t0raw, uint64_t texa) {
         ke->gen = gen;
         ke->sig = tex_sig(t0);
         ke->valid = 1;
+        ke->cont = cont;
         gVglKeys++;
     }
     sSigGenCur = gen; /* (the signature) */
-    if (sLast != NULL && sLast->tex0 == t0 && sLast->texa == texa && sLast->gen == gen) {
+    const uint64_t t0k = tex_key0(t0, cont);
+    if (sLast != NULL && sLast->tex0 == t0k && sLast->texa == texa && sLast->gen == gen) {
         sLast->last = gGsFrame;
         return sLast->id;
     }
     {
-        uint32_t h = bucket_of(t0, texa, gen);
+        uint32_t h = bucket_of(t0k, texa, gen);
         while (sTexBucket[h] != 0) {
             Tex *c = &sTex[sTexBucket[h] - 1];
-            if (c->tex0 == t0 && c->texa == texa && c->gen == gen) {
+            if (c->tex0 == t0k && c->texa == texa && c->gen == gen) {
                 c->last = gGsFrame;
                 sLast = c;
+                if (cont) {
+                    gVitaTexContN[0] += c->tex0a != t0; /* (found where it was not made) */
+                }
                 return c->id;
             }
             h = (h + 1) & (TEX_BUCKETS - 1);
         }
+    }
+    if (cont) {
+        gVitaTexContN[2]++;
     }
     if (sTexBudgetFrame != gGsFrame) {
         sTexBudgetFrame = gGsFrame;
@@ -2353,7 +2379,8 @@ static GLuint texture_get_k_(uint64_t t0raw, uint64_t texa) {
         if (pi >= 0 && pp >= 0) {
             uint32_t *cw;
             t = &sTex[sTexCount++];
-            t->tex0 = t0;
+            t->tex0 = t0k;
+            t->tex0a = t0;
             t->texa = texa;
             t->gen = gen;
             t->last = gGsFrame;
@@ -2373,7 +2400,7 @@ static GLuint texture_get_k_(uint64_t t0raw, uint64_t texa) {
                 cw[3] = (cw[3] & 0xFC000000u) | ((uint32_t)(uintptr_t)sPalT[pp].data >> 6);
             }
             {
-                uint32_t h = bucket_of(t0, texa, gen);
+                uint32_t h = bucket_of(t0k, texa, gen); gVitaTexContN[1] += cont;
                 while (sTexBucket[h] != 0) {
                     h = (h + 1) & (TEX_BUCKETS - 1);
                 }
@@ -2430,7 +2457,8 @@ static GLuint texture_get_k_(uint64_t t0raw, uint64_t texa) {
     }
     rt_sync(); /* (gVitaTexEarly: the pixels read and converted while the render thread drew) */
     t = &sTex[sTexCount++];
-    t->tex0 = t0;
+    t->tex0 = t0k;
+    t->tex0a = t0;
     t->texa = texa;
     t->gen = gen;
     t->last = gGsFrame;
@@ -2473,7 +2501,7 @@ static GLuint texture_get_k_(uint64_t t0raw, uint64_t texa) {
     }
       gVitaWall[3] += sceKernelGetProcessTimeWide() - w0; }
     {
-        uint32_t h = bucket_of(t0, texa, gen);
+        uint32_t h = bucket_of(t0k, texa, gen); gVitaTexContN[1] += cont;
         while (sTexBucket[h] != 0) {
             h = (h + 1) & (TEX_BUCKETS - 1);
         }

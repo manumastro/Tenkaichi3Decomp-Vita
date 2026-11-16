@@ -994,6 +994,15 @@ void Vita_VBlank(unsigned vblanks) {
                     extern unsigned gVitaRunEstN;
                     logf_("vita:   the work targets' way: %u states remembered taken, %u worked out, %u remembered; runs' first triangles the quick way %u\n",
                           gVitaWtC[0], gVitaWtC[1], gVitaWtC[2], gVitaRunEstN);
+                    {
+                        extern int gVitaTexCont;
+                        extern unsigned gVitaTexContN[3];
+                        if (gVitaTexCont != 0) {
+                            logf_("vita:   texcont: %u textures found at another place than they were made at; %u made, %u looked up the long way\n",
+                                  gVitaTexContN[0], gVitaTexContN[1], gVitaTexContN[2]);
+                        }
+                        memset(gVitaTexContN, 0, sizeof(gVitaTexContN));
+                    }
                     gVitaRunEstN = 0;
                     memset(gVitaWtC, 0, sizeof(gVitaWtC));
                 }
@@ -1441,6 +1450,9 @@ static void read_settings(void) {
         } else if (strcmp(line, "stx") == 0) { /* 0: no states kept from one picture to the next */
             extern int gVitaStXOn;
             gVitaStXOn = atoi(eq) != 0;
+        } else if (strcmp(line, "texcont") == 0) { /* a texture found by its contents wherever GS memory holds them: 0 off, 1 on, 2 soak B */
+            extern int gVitaTexCont;
+            gVitaTexCont = atoi(eq);
         } else if (strcmp(line, "stlast") == 0) { /* 0: no state of the call before (as an earlier version) */
             extern int gVitaStLastOn;
             gVitaStLastOn = atoi(eq) != 0;
