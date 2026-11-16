@@ -1012,7 +1012,11 @@ void Vita_VBlank(unsigned vblanks) {
                         {
                             extern unsigned gVitaDpTexaN[2], gVitaTexRtN[3], gVitaFxClampN[2];
                             extern void Gs_GifShapesLog(void);
-                            logf_("vita:   fxclamp: %u runs, %u triangles\n", gVitaFxClampN[0], gVitaFxClampN[1]);
+                            {
+                                extern unsigned gVitaDpGenN[1];
+                                logf_("vita:   fxclamp: %u runs, %u triangles | dpgen: %u state fields changed by kept parts\n", gVitaFxClampN[0], gVitaFxClampN[1], gVitaDpGenN[0]);
+                                gVitaDpGenN[0] = 0;
+                            }
                             memset(gVitaFxClampN, 0, sizeof(gVitaFxClampN));
                             Gs_GifShapesLog();
                             logf_("vita:   kept forms without TEXA (dptexa): %u; parts walked whose kept form differed in TEXA alone: %u | texrt: %u pieces from the pools, %u made the old way, %u textures set up by the render thread\n",
@@ -1487,6 +1491,9 @@ static void read_settings(void) {
         } else if (strcmp(line, "wtsig") == 0) { /* the targets' signatures worked out only when GS memory changed: 0 off, 1 on, 2 soak B */
             extern int gVitaWtSig;
             gVitaWtSig = atoi(eq);
+        } else if (strcmp(line, "dpgen") == 0) { /* a kept part's register changes bump the state's generation: 0 off, 1 on, 2 soak B */
+            extern int gVitaDpGen;
+            gVitaDpGen = atoi(eq);
         } else if (strcmp(line, "adfast") == 0) { /* GIF tags of A+D writes written in one loop: 0 off, 1 on, 2 soak B */
             extern int gVitaAdFast;
             gVitaAdFast = atoi(eq);

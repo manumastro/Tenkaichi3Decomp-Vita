@@ -3898,14 +3898,32 @@ static int dp_match(const DpForm *f) {
     }
     return 1;
 }
+/* bt3.txt dpgen: a kept part drawn from its kept form leaves the GS registers it wrote as the walk left them
+   (dp_apply), written into gs directly: the state's generation (gGsStateGen, gGsStateGenX: vita_vgl.c's quick way
+   reuses a state while it does not move) was not bumped, and the registers' shadow (reg_write's "the same value
+   again") still held the value before the part, so a GS primitive after a part that changed, say, ALPHA could be drawn
+   with the state remembered from before it. Now a field it changes bumps both and spoils that register's shadow.
+   0 off, 1 on, 2 the soak's B battles (in the BT4 fork ~7,000 such fields every 2 s in 2 vs 2; on there). */
+int gVitaDpGen;
+unsigned gVitaDpGenN[1]; /* (the log) state fields changed by kept parts, the generation bumped */
+static const uint8_t kDpFieldReg[32] = {0x00, 0x00, 0x01, 0x02, 0x03, 0x3B, 0x1A, 0x1B, 0x06, 0x07, 0x14, 0x15, 0x08, 0x09, 0x18, 0x19,
+                                        0x40, 0x41, 0x42, 0x43, 0x47, 0x48, 0x4C, 0x4D, 0x4E, 0x4F, 0x4A, 0x4B, 0x50, 0x51, 0x52, 0x53};
 static void dp_apply(const DpForm *f) {
     uint64_t m = f->wr;
+    const int gen = gVitaDpGen == 2 ? gVitaAbSide == 1 : gVitaDpGen != 0;
     while (m != 0) {
         int i = __builtin_ctzll(m);
         if (i < 32) {
             uint64_t x = f->exit[i];
             if ((i == 22 || i == 23) && (x & 0x8000u) && gGsMainFbp >= 0) {
                 x = (x & ~0x81FFull) | (uint64_t)gGsMainFbp; /* ("the picture": the buffer of now) */
+            }
+            if (gen && (i < 2 || i > 4) && (&gs.prim)[i] != x) { /* (dpgen; RGBAQ, ST, UV are a vertex's own) */
+                uint32_t a = kDpFieldReg[i];
+                sRegShadow[a] = 0xA5A5A5A5A5A5A5A5ull; /* (no value the game writes: its next write counts as a change) */
+                gGsStateGen++;
+                gGsStateGenX += a != 0x00 && a != 0x06 && a != 0x07;
+                gVitaDpGenN[0]++;
             }
             (&gs.prim)[i] = x;
         } else if (i == 32) {
